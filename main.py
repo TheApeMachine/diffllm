@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # ================================================================
-#  Diffusion‑based Code‑Generator — extended edition  ✧ v2 ✧
-#  (original lines retained; see “NEW CAPABILITIES” section below)
+#  Diffusion‑based Code‑Generator — extended edition  ✧ v3 ✧
 # ================================================================
 
 import math
@@ -29,23 +28,20 @@ from torchtext.vocab import build_vocab_from_iterator, Vocab
 # 0. Reproducibility helpers
 # ----------------------------------------------------------------
 def set_seed(seed: int = 42) -> None:
-    """Make results (reasonably) reproducible across CPU & GPU runs."""
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True   # slower, but reproducible
+    torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
 set_seed()
 
 # ----------------------------------------------------------------
-# Original code ‑‑ kept verbatim
+# ----------------------- ORIGINAL   CODE ------------------------
 # ----------------------------------------------------------------
-# NOTE: Global `device` variable is removed. It will be managed by the main() function.
+# (unchanged except where explicitly noted)
 
 # --- 1. Timestep Embedding ---
-# This module converts a timestep integer into a continuous, high-dimensional vector.
-# This allows the model to know at which point in the diffusion process it is operating.
 class TimestepEmbedding(nn.Module):
     def __init__(self, dim, max_period=10000):
         super().__init__()
@@ -58,654 +54,424 @@ class TimestepEmbedding(nn.Module):
             -math.log(self.max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
         ).to(device=t.device)
         args = t[:, None].float() * freqs[None, :]
-        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         if self.dim % 2:
-            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-        return embedding
+            emb = torch.cat([emb, torch.zeros_like(emb[:, :1])], dim=-1)
+        return emb
 
-# --- 2. The Diffusion Model ---
-# This is the core neural network that learns to reverse the diffusion process.
-# It's conditioned on the noisy input and the current timestep.
-class DiffusionModel(nn.Module):
-    def __init__(self, vocab_size, hidden_size, num_layers, num_heads, dim_feedforward):
-        super(DiffusionModel, self).__init__()
-        # The embedding layer is part of the model, its weights will be trained
-        self.embedding = nn.Embedding(vocab_size, hidden_size)
-        
-        # Timestep embedding to condition the model on the noise level
-        self.time_embedding = TimestepEmbedding(hidden_size)
-        
-        # --- The Transformer Encoder ---
-        # This replaces the LSTM. It's more powerful for capturing context.
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_size,
-            nhead=num_heads,
-            dim_feedforward=dim_feedforward,
-            batch_first=True # This is crucial for our data shape
-        )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        
-        # The linear layer predicts the noise that was added to the embeddings
-        # Its output size must be hidden_size to match the noise dimension
-        self.linear = nn.Linear(hidden_size, hidden_size)
-
-    def forward(self, noisy_embeddings, t):
-        # noisy_embeddings: (batch, seq_len, hidden_size)
-        # t: (batch,) with timesteps for each sequence
-        
-        # 1. Get timestep embedding and add it to the input
-        time_emb = self.time_embedding(t).unsqueeze(1)
-        conditioned_input = noisy_embeddings + time_emb
-        
-        # 2. Pass through the Transformer Encoder
-        transformer_out = self.transformer_encoder(conditioned_input)
-        
-        # 3. Predict the added noise from the Transformer's output
-        noise_prediction = self.linear(transformer_out)
-        
-        return noise_prediction
-
-# --- 3. Hyperparameters ---
+# --- 2. Hyper‑parameters (defaults) ---
 vocab_size = 10000
 hidden_size = 512
-num_layers = 6 # Transformers can be deeper
-learning_rate = 0.001
+num_layers = 6
+learning_rate = 1e-3
 batch_size = 32
 sequence_length = 64
-num_timesteps = 1000  # A more realistic number of timesteps for diffusion
-epochs = 100 # Increased epochs for demonstration
-steps_per_epoch = 200 # Run multiple steps per "epoch" for more frequent feedback
-# --- New Transformer Hyperparameters ---
-num_heads = 8 # Number of attention heads
-dim_feedforward = 2048 # Dimension of the feedforward network
-
-# --- 4. Noise Schedule ---
-# Defines how much noise is added at each timestep.
-# This uses a linear schedule for the variance (beta).
-def get_noise_schedule(num_timesteps, beta_start=0.0001, beta_end=0.02):
-    betas = torch.linspace(beta_start, beta_end, num_timesteps, device=device)
-    alphas = 1. - betas
-    alphas_cumprod = torch.cumprod(alphas, axis=0)
-    return alphas_cumprod
-
-# Helper to get the correct alpha values for a batch of timesteps
-def get_schedule_values(alphas_cumprod, t, shape):
-    batch_size = t.shape[0]
-    alphas_t = alphas_cumprod.gather(-1, t)
-    return alphas_t.reshape(batch_size, *((1,) * (len(shape) - 1))).expand(shape)
-
-# --- 5. Training Loop ---
-def train(model, criterion, optimizer, epochs, steps_per_epoch):
-    alphas_cumprod = get_noise_schedule(num_timesteps)
-    
-    for epoch in range(epochs):
-        for step in range(steps_per_epoch):
-            # --- The Diffusion Process ---
-            
-            # Start with clean data (e.g., a batch of token sequences)
-            inputs = torch.randint(0, vocab_size, (batch_size, sequence_length), device=device)
-            
-            # Sample a random timestep t for each sequence in the batch
-            t = torch.randint(0, num_timesteps, (batch_size,), device=device).long()
-            
-            # 1. Convert token IDs to continuous embeddings
-            clean_embeddings = model.embedding(inputs)
-            
-            # 2. Get noise and alpha values for the sampled timesteps
-            sqrt_alphas_cumprod_t = get_schedule_values(
-                torch.sqrt(alphas_cumprod), t, clean_embeddings.shape
-            )
-            sqrt_one_minus_alphas_cumprod_t = get_schedule_values(
-                torch.sqrt(1. - alphas_cumprod), t, clean_embeddings.shape
-            )
-            
-            # 3. Create noise and apply it to the embeddings to get x_t
-            noise = torch.randn_like(clean_embeddings)
-            noisy_embeddings = sqrt_alphas_cumprod_t * clean_embeddings + sqrt_one_minus_alphas_cumprod_t * noise
-            
-            # --- The Denoising (Reverse) Process ---
-            
-            # 4. Predict the original noise from the noisy embeddings
-            noise_prediction = model(noisy_embeddings, t)
-            
-            # 5. Calculate the loss between the model's prediction and the actual noise
-            loss = criterion(noise_prediction, noise)
-            
-            # 6. Backward pass and optimization step
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            
-        print(f'Epoch [{epoch+1}/{epochs}], Last Step Loss: {loss.item():.4f}')
+num_timesteps = 1000
+epochs = 100
+steps_per_epoch = 200
+num_heads = 8
+dim_feedforward = 2048
 
 # ----------------------------------------------------------------
-# ======================  NEW  CAPABILITIES  ======================
+# ======================  NEW  CAPABILITIES  =====================
 # ----------------------------------------------------------------
-#  Everything beyond this point is *additive*.  Older imports / names
-#  are untouched, so your previous workflows keep working.
+#  Everything beyond this line is additive / replace‑in‑place.
 
-# --- 6‑A. Positional Encoding & Mask‑aware Transformer -----------------------
+# 6‑A. Learned positional encodings + padding‑aware Transformer
 class PositionalEncoding(nn.Module):
-    """Learned positional embeddings (better than sinusoid for code tokens)."""
     def __init__(self, max_len: int, dim: int):
         super().__init__()
         self.pe = nn.Embedding(max_len, dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, L, D)
         B, L, _ = x.size()
         pos = torch.arange(L, device=x.device).unsqueeze(0).expand(B, L)
         return self.pe(pos)
 
-
 class DiffusionTransformerPE(nn.Module):
     """
-    Improved model featuring:
-      • learned positional embeddings
-      • pad‑masking in attention
-      • same public API as DiffusionModel, plus optional pad_mask arg
+    * self‑conditioning ready
+    * returns (noise_pred, x0_pred)
     """
-    def __init__(self,
-                 vocab_size: int,
-                 hidden_size: int,
-                 num_layers: int,
-                 num_heads: int,
-                 dim_feedforward: int,
-                 max_seq_len: int,
-                 pad_id: int):
+    def __init__(self, vocab_size: int, hidden: int, layers: int,
+                 heads: int, ff: int, max_len: int, pad_id: int):
         super().__init__()
         self.pad_id = pad_id
-        self.embedding = nn.Embedding(vocab_size, hidden_size, padding_idx=pad_id)
-        self.pos_embedding = PositionalEncoding(max_seq_len, hidden_size)
-        self.time_embedding = TimestepEmbedding(hidden_size)
+        self.embedding = nn.Embedding(vocab_size, hidden, padding_idx=pad_id)
+        self.pos_embedding = PositionalEncoding(max_len, hidden)
+        self.time_embedding = TimestepEmbedding(hidden)
+        self.sc_proj = nn.Linear(hidden, hidden, bias=False)      # self‑cond projection
 
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_size,
-            nhead=num_heads,
-            dim_feedforward=dim_feedforward,
-            batch_first=True
-        )
-        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
-        self.proj = nn.Linear(hidden_size, hidden_size)
+        enc = nn.TransformerEncoderLayer(d_model=hidden,
+                                         nhead=heads,
+                                         dim_feedforward=ff,
+                                         batch_first=True)
+        self.encoder = nn.TransformerEncoder(enc, num_layers=layers)
+        self.head = nn.Linear(hidden, hidden * 2)                 # outputs ε̂  |  x̂₀
 
-    def forward(self,
-                noisy_embeddings: torch.Tensor,
-                t: torch.Tensor,
-                pad_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Parameters
-        ----------
-        noisy_embeddings : (B, L, H)
-        t                : (B,)
-        pad_mask         : (B, L) True for PAD tokens; may be None
-        """
-        time_emb = self.time_embedding(t).unsqueeze(1)            # (B,1,H)
-        x = noisy_embeddings + time_emb + self.pos_embedding(noisy_embeddings)
+    def forward(self, noisy_emb: torch.Tensor, t: torch.Tensor,
+                pad_mask: Optional[torch.Tensor] = None,
+                self_cond: Optional[torch.Tensor] = None
+                ) -> Tuple[torch.Tensor, torch.Tensor]:
+
+        if self_cond is None:
+            self_cond = torch.zeros_like(noisy_emb)
+        x = noisy_emb + self.sc_proj(self_cond)
+        x = x + self.pos_embedding(x) + self.time_embedding(t).unsqueeze(1)
         x = self.encoder(x, src_key_padding_mask=pad_mask)
-        return self.proj(x)                                        # ε̂
+        noise_pred, x0_pred = self.head(x).chunk(2, dim=-1)
+        return noise_pred, x0_pred
 
-# --- 6‑B. β‑schedule variants (linear | cosine) ------------------------------
-def get_noise_schedule_v2(num_timesteps: int,
-                          schedule: str = "linear",
-                          beta_start: float = 0.0001,
-                          beta_end: float = 0.02,
-                          device: torch.device = torch.device("cpu"),
-                          ) -> torch.Tensor:
-    """
-    Return ᾱ_t (cumprod) for chosen schedule.
-    Ref: Improved DDPM (Nichol & Dhariwal).
-    """
+# 6‑B. β‑schedule (linear | cosine)
+def get_noise_schedule_v2(T: int, schedule: str, device, beta_start=1e-4, beta_end=2e-2):
     if schedule == "linear":
-        betas = torch.linspace(beta_start, beta_end, num_timesteps, device=device)
+        betas = torch.linspace(beta_start, beta_end, T, device=device)
     elif schedule == "cosine":
-        s = 0.008  # offset per paper
-        steps = torch.arange(num_timesteps + 1, device=device) / num_timesteps
-        alphas_cumprod = torch.cos((steps + s) / (1 + s) * math.pi / 2) ** 2
-        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-        betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-        betas = betas.clamp(1e-5, 0.999)
+        s = 0.008
+        steps = torch.arange(T + 1, device=device) / T
+        al_c = torch.cos((steps + s) / (1 + s) * math.pi / 2) ** 2
+        al_c = al_c / al_c[0]
+        betas = 1 - (al_c[1:] / al_c[:-1])
+        betas = betas.clamp(1e-5, .999)
     else:
-        raise ValueError(f"Unknown schedule '{schedule}'")
-    alphas = 1.0 - betas
+        raise ValueError(schedule)
+    alphas = 1 - betas
     return torch.cumprod(alphas, dim=0)
 
-# --- 6‑C. Exponential Moving Average (EMA) of weights ------------------------
+# 6‑C. EMA (unchanged)
 class EMA:
-    """Shadow parameters for more stable sampling."""
-    def __init__(self, model: nn.Module, decay: float = 0.999):
+    def __init__(self, model, decay=0.999):
         self.decay = decay
         self.shadow = {}
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                self.shadow[name] = param.data.clone()
+        # Register the model parameters, handling DDP-wrapped models
+        model_to_register = model.module if hasattr(model, 'module') else model
+        for n, p in model_to_register.named_parameters():
+            if p.requires_grad:
+                self.shadow[n] = p.data.clone()
 
-    def update(self, model: nn.Module):
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                self.shadow[name].mul_(self.decay).add_(
-                    param.data, alpha=1.0 - self.decay)
+    def update(self, model):
+        # Update shadow parameters, handling DDP-wrapped models
+        model_to_update = model.module if hasattr(model, 'module') else model
+        for n, p in model_to_update.named_parameters():
+            if p.requires_grad:
+                assert n in self.shadow, f"Parameter {n} not found in EMA shadow."
+                self.shadow[n].mul_(self.decay).add_(p.data, alpha=1 - self.decay)
 
     def apply_to(self, model: nn.Module):
         self.backup = {}
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                self.backup[name] = param.data.clone()
-                param.data.copy_(self.shadow[name])
+        for n, p in model.named_parameters():
+            if p.requires_grad:
+                self.backup[n] = p.data.clone()
+                p.data.copy_(self.shadow[n])
 
     def restore(self, model: nn.Module):
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                param.data.copy_(self.backup[name])
-        self.backup = {}
+        for n, p in model.named_parameters():
+            if p.requires_grad:
+                p.data.copy_(self.backup[n])
 
-# --- 6‑D. Utility helpers ---------------------------------------------------
-def embeddings_to_tokens(
-    embeds: torch.Tensor,  # (B, L, H)
-    embedding_weights: torch.Tensor
-) -> torch.Tensor:
-    """Nearest‑neighbor decode embeddings back to token IDs."""
-    logits = torch.matmul(embeds, embedding_weights.t())  # (B, L, |V|)
-    return logits.argmax(dim=-1)
+# 6‑D. helpers
+def get_schedule_values(acp: torch.Tensor, t: torch.Tensor, shape):
+    B = t.shape[0]
+    al_t = acp.gather(0, t)
+    return al_t.view(B, *((1,) * (len(shape) - 1))).expand(shape)
 
-# --- 6‑E. Diffusion Sampler  (unchanged logic, now EMA‑aware) ---------------
-class DiffusionSampler(nn.Module):
-    def __init__(
-        self,
-        model: nn.Module,
-        alphas_cumprod: torch.Tensor,
-        num_timesteps: int,
-        device: torch.device,
-    ):
+def embeddings_to_tokens(emb: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
+    return torch.matmul(emb, W.t()).argmax(-1)
+
+# 6‑E. DDPM Sampler (self‑cond aware)
+class DDPM_Sampler(nn.Module):
+    def __init__(self, model, acp, T, device):
         super().__init__()
-        self.model = model
-        self.num_timesteps = num_timesteps
-        self.device = device
-
-        acp = alphas_cumprod.to(device)
-        acp_prev = torch.cat([torch.tensor([1.0], device=device), acp[:-1]])
-        alphas = acp / acp_prev
-        betas = 1.0 - alphas
-
-        self.register_buffer("betas", betas)
-        self.register_buffer("alphas_cumprod", acp)
-        self.register_buffer("sqrt_recip_alphas", torch.sqrt(1.0 / alphas))
-        self.register_buffer("sqrt_one_minus_alphas_cumprod", torch.sqrt(1.0 - acp))
+        self.model, self.acp, self.T, self.device = model, acp, T, device
+        acp_prev = torch.cat([torch.tensor([1.], device=device), acp[:-1]])
+        self.alphas, self.betas = acp / acp_prev, 1 - acp / acp_prev
+        self.sqrt_recip = (1 / self.alphas).sqrt()
+        self.sqrt_om_acp = (1 - acp).sqrt()
 
     @torch.no_grad()
-    def sample(self,
-               batch_size: int,
-               seq_len: int,
-               pad_mask: Optional[torch.Tensor] = None,
-               return_tokens: bool = True
-               ) -> Tuple[torch.Tensor, torch.Tensor]:
-        x_t = torch.randn(batch_size, seq_len, hidden_size, device=self.device)
-
-        for t_ind in reversed(range(self.num_timesteps)):
-            t = torch.full((batch_size,), t_ind, dtype=torch.long, device=self.device)
-            # Model may or may not take a pad_mask argument
-            sig = inspect.signature(self.model.forward)
-            if "pad_mask" in sig.parameters:
-                eps_theta = self.model(x_t, t, pad_mask)
-            else:
-                eps_theta = self.model(x_t, t)
-
-            posterior_mean = self.sqrt_recip_alphas[t_ind] * (
-                x_t - (self.betas[t_ind] / self.sqrt_one_minus_alphas_cumprod[t_ind]) * eps_theta
-            )
-
+    def sample(self, B, L, pad_mask=None):
+        x = torch.randn(B, L, hidden_size, device=self.device)
+        self_cond = None
+        for t_ind in reversed(range(self.T)):
+            t = torch.full((B,), t_ind, dtype=torch.long, device=self.device)
+            eps, x0 = self.model(x, t, pad_mask, self_cond)
+            self_cond = x0                      # feed self‑cond next step
+            mean = self.sqrt_recip[t_ind] * (x - self.betas[t_ind] / self.sqrt_om_acp[t_ind] * eps)
             if t_ind > 0:
-                noise = torch.randn_like(x_t)
-                x_t = posterior_mean + torch.sqrt(self.betas[t_ind]) * noise
+                noise = torch.randn_like(x)
+                x = mean + self.betas[t_ind].sqrt() * noise
             else:
-                x_t = posterior_mean
+                x = mean
+        tok = embeddings_to_tokens(x, self.model.embedding.weight)
+        return tok
 
-        if return_tokens:
-            tokens = embeddings_to_tokens(x_t, self.model.embedding.weight)
-            return x_t, tokens
-        return x_t
+# 6‑F. DDIM Sampler ----------------------------------------------------------
+class DDIM_Sampler(nn.Module):
+    def __init__(self, model, acp, T, device, steps=50, eta=0.0):
+        super().__init__()
+        self.model, self.device = model, device
+        self.acp = acp
+        self.eta = eta
+        self.steps = torch.linspace(0, T - 1, steps, dtype=torch.long)
 
-# --- 6‑F. Gradient‑accumulating, EMA‑aware Trainer --------------------------
-def train_improved(
-    model: nn.Module,
-    criterion: nn.Module,
-    optimizer: optim.Optimizer,
-    epochs: int,
-    steps_per_epoch: int,
-    grad_clip: float,
-    grad_accum: int,
-    ckpt_dir: str,
-    amp: bool,
-    pad_id: int,
-    alphas_cumprod: torch.Tensor,
-    train_loader: DataLoader,
-    vocab,
-    ema: Optional[EMA],
-    sample_every: int,
-    args: argparse.Namespace,
-    device: torch.device,
-    is_ddp: bool,
-) -> None:
+    @torch.no_grad()
+    def sample(self, B, L, pad_mask=None):
+        x = torch.randn(B, L, hidden_size, device=self.device)
+        self_cond = None
+        for i in reversed(range(1, len(self.steps))):
+            t = self.steps[i]
+            t_prev = self.steps[i - 1]
+            a_t, a_prev = self.acp[t], self.acp[t_prev]
 
-    ckpt_path = Path(ckpt_dir)
-    ckpt_path.mkdir(exist_ok=True)
-    scaler = torch.cuda.amp.GradScaler(enabled=(amp and device.type == "cuda"))
+            t_long = torch.full((B,), t.item(), dtype=torch.long, device=self.device)
+            eps, x0 = self.model(x, t_long, pad_mask, self_cond)
+            self_cond = x0
 
-    # Determine rank for distributed training
+            x0_pred = (x - (1 - a_t).sqrt() * eps) / a_t.sqrt()
+            sigma = self.eta * ((1 - a_prev) / (1 - a_t)).sqrt() * (1 - a_t / a_prev).sqrt()
+            dir_xt = (1 - a_prev - sigma ** 2).sqrt() * eps
+            noise = torch.randn_like(x) if sigma > 0 else 0
+            x = a_prev.sqrt() * x0_pred + dir_xt + sigma * noise
+
+        tok = embeddings_to_tokens(x, self.model.embedding.weight)
+        return tok
+
+# 6‑G. Trainer with self‑conditioning ----------------------------------------
+def train(model, criterion, opt, epochs, steps_ep, loader, acp, ema, device, amp, sampler_cfg, is_ddp, ckpt_dir: str, args: argparse.Namespace):
+
+    scaler = torch.cuda.amp.GradScaler(enabled=amp and device.type == "cuda")
+    data_iter = iter(loader)
     rank = dist.get_rank() if is_ddp else 0
+    ckpt_path = Path(ckpt_dir); ckpt_path.mkdir(exist_ok=True)
+    pad_id = loader.dataset.vocab.get_stoi()["<pad>"]
+    grad_clip = args.grad_clip
+    grad_accum = args.grad_accum
 
-    data_iter = iter(train_loader)
-    running_loss = 0.0
-
-    for epoch in range(1, epochs + 1):
+    for ep in range(1, epochs + 1):
         model.train()
-        t0 = time.time()
+        running = 0
+        tic = time.time()
 
-        for step in range(steps_per_epoch):
-            # ---------------- Load batch ----------------
+        for step in range(steps_ep):
             try:
                 batch = next(data_iter)
             except StopIteration:
-                data_iter = iter(train_loader)
+                data_iter = iter(loader)
                 batch = next(data_iter)
 
-            inputs = batch.to(device)           # (B, L)
-            pad_mask = (inputs == pad_id)       # (B, L)
+            x_tokens = batch.to(device)
+            pad_mask = (x_tokens == pad_id)
+            B = x_tokens.size(0)
+            t = torch.randint(0, num_timesteps, (B,), device=device)
 
-            # ---------------- Forward diffusion ---------
-            B = inputs.size(0)
-            t = torch.randint(0, num_timesteps, (B,), device=device, dtype=torch.long)
+            # Get the underlying model when using DDP
+            underlying_model = model.module if is_ddp else model
+            clean = underlying_model.embedding(x_tokens)
+            
+            sq_a = get_schedule_values(acp.sqrt(), t, clean.shape)
+            sq_1ma = get_schedule_values((1 - acp).sqrt(), t, clean.shape)
+            noise = torch.randn_like(clean)
+            noisy = sq_a * clean + sq_1ma * noise
 
-            clean_emb = model.embedding(inputs)
-            sqrt_a = get_schedule_values(torch.sqrt(alphas_cumprod), t, clean_emb.shape)
-            sqrt_1ma = get_schedule_values(torch.sqrt(1.0 - alphas_cumprod), t, clean_emb.shape)
-            noise = torch.randn_like(clean_emb)
-            noisy_emb = sqrt_a * clean_emb + sqrt_1ma * noise
+            use_sc = random.random() < 0.5
+            with torch.cuda.amp.autocast(enabled=amp and device.type == "cuda"):
+                # first pass (to obtain x0_pred)
+                eps1, x0_1 = model(noisy, t, pad_mask, self_cond=None)
+                # optional second pass with self‑cond
+                eps = eps1
+                if use_sc:
+                    eps, _ = model(noisy, t, pad_mask, self_cond=x0_1.detach())
 
-            # ---------------- Reverse + loss ------------
-            with torch.cuda.amp.autocast(enabled=(amp and device.type == "cuda")):
-                sig = inspect.signature(model.forward)
-                if "pad_mask" in sig.parameters:
-                    pred_noise = model(noisy_emb, t, pad_mask)
-                else:
-                    pred_noise = model(noisy_emb, t)
-                loss = criterion(pred_noise, noise) / grad_accum
+                loss = criterion(eps, noise) / grad_accum
 
             scaler.scale(loss).backward()
-            running_loss += loss.item() * grad_accum  # un‑scaled for logging
+            running += loss.item() * grad_accum
 
-            # ------------- Optimise every grad_accum ----
             if (step + 1) % grad_accum == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)
+                scaler.step(opt); scaler.update(); opt.zero_grad(set_to_none=True)
+                if ema: ema.update(model)
 
-                if ema is not None:
-                    ema.update(model)
+        if rank == 0:
+            print(f"Epoch {ep:03}/{epochs:03}  loss={running/steps_ep:.4f}  {time.time()-tic:.1f}s")
 
-        # ---------------- Epoch‑end log / sample -------
-        avg_loss = running_loss / steps_per_epoch
-        running_loss = 0.0
-        dt = time.time() - t0
-        print(f"Epoch {epoch:03}/{epochs:03}  loss={avg_loss:.4f}  {dt:.1f}s")
+            if ep % sampler_cfg["every"] == 0 or ep == epochs:
+                # --- Save Checkpoint ---
+                mdl = model.module if is_ddp else model
+                ckpt_file = ckpt_path / f"model_epoch{ep:03}.pt"
+                torch.save(
+                    {"epoch": ep,
+                     "model_state": mdl.state_dict(),
+                     "optimizer_state": opt.state_dict(),
+                     "args": args},
+                    ckpt_file
+                )
+                print(f" ↳ checkpoint saved: {ckpt_file}")
 
-        # Checkpoint + quick text sample (only on main process)
-        if rank == 0 and ((epoch % sample_every == 0) or (epoch == epochs)):
-            # When using DDP, we need to save the state of the underlying model.
-            model_to_save = model.module if is_ddp else model
+                # --- Generate Sample ---
+                if ema: ema.apply_to(mdl)
+                sampler = (DDIM_Sampler if sampler_cfg["kind"] == "ddim" else DDPM_Sampler)(
+                    mdl, acp, num_timesteps, device,
+                    **sampler_cfg.get("extra", {})
+                )
+                sample = sampler.sample(1, sequence_length)[0]
+                print(" ↳ sample:", " ".join(loader.dataset.vocab.lookup_tokens(sample.tolist())))
+                if ema: ema.restore(mdl)
 
-            ckpt_file = ckpt_path / f"model_epoch{epoch:03}.pt"
-            torch.save(
-                {"epoch": epoch,
-                 "model_state": model_to_save.state_dict(),
-                 "optimizer_state": optimizer.state_dict(),
-                 "args": args}, # <-- Save training args
-                ckpt_file
-            )
-            print(f" ↳ checkpoint saved: {ckpt_file}")
-
-            # Sampling (with EMA weights if available)
-            sampler = DiffusionSampler(model_to_save, alphas_cumprod, num_timesteps, device)
-            if ema:
-                ema.apply_to(model_to_save)
-            model_to_save.eval()
-            _, sample_tok = sampler.sample(batch_size=1, seq_len=inputs.size(1))
-            if ema:
-                ema.restore(model_to_save)
-            
-            # Switch back to train mode for the main model
-            model.train()
-
-            text = " ".join(vocab.lookup_tokens(sample_tok.squeeze(0).tolist()))
-            print(f' ↳ sample: "{text}"')
-
-# --- 6‑G. Code‑corpus Dataset (optional) ------------------------------------
+# 6‑H. Datasets ---------------------------------------------------------------
 class CodeDataset(Dataset):
-    """Simple recursive loader turning code files into token sequences."""
-    def __init__(self, root_dir: str, tokenizer, seq_len: int):
-        self.seq_len = seq_len
-        self.tokenizer = tokenizer
-        self.samples: List[List[str]] = []
-
-        root = Path(root_dir)
-        print(f"Scanning {root} for code files …")
-        for path in root.rglob("*"):
-            if path.suffix.lower() in {".py", ".js", ".ts", ".go", ".java", ".cs", ".cpp", ".c"}:
+    exts = {".py", ".js", ".ts", ".go", ".java", ".cs", ".cpp", ".c"}
+    def __init__(self, root, tok, L):
+        self.tok, self.L = tok, L
+        self.samples = []
+        for p in Path(root).rglob("*"):
+            if p.suffix.lower() in self.exts:
                 try:
-                    text = path.read_text(encoding="utf8", errors="ignore")
+                    text = p.read_text(encoding="utf8", errors="ignore")
                 except Exception:
                     continue
-                tokens = tokenizer(text)
-                # Slice long files into many seq_len chunks
-                for i in range(0, len(tokens), seq_len):
-                    chunk = tokens[i:i + seq_len]
-                    if chunk:
-                        self.samples.append(chunk)
-
+                toks = tok(text)
+                for i in range(0, len(toks), L):
+                    chunk = toks[i:i+L]
+                    if chunk: self.samples.append(chunk)
         if not self.samples:
-            raise RuntimeError(f"No suitable code files found in {root_dir}")
-        print(f"CodeDataset: {len(self.samples)} chunks.")
+            raise RuntimeError("no code found")
 
-    def __len__(self):
-        return len(self.samples)
+    def __len__(self): return len(self.samples)
+    def __getitem__(self, i): return self.samples[i]
 
-    def __getitem__(self, idx):
-        return self.samples[idx]
-
-def build_vocab_from_dataset(dataset: List[List[str]],
-                             specials: List[str]) -> Vocab:
-    return build_vocab_from_iterator(iter(dataset), specials=specials)
-
-def code_collate(batch: List[List[str]],
-                 vocab,
-                 seq_len: int,
-                 pad_id: int) -> torch.Tensor:
-    out = []
-    for tokens in batch:
-        ids = vocab(tokens)
-        if len(ids) < seq_len:
-            ids += [pad_id] * (seq_len - len(ids))
-        else:
-            ids = ids[:seq_len]
-        out.append(torch.tensor(ids, dtype=torch.long))
-    return torch.stack(out)
-
-# --- 6‑H. Data loading helper -----------------------------------------------
-def prepare_data_loader(
-    batch_size: int,
-    seq_len: int,
-    data_dir: Optional[str] = None,
-    is_ddp: bool = False,
-):
+def make_loader(batch_size: int,
+                seq_len: int,
+                data_dir: Optional[str] = None,
+                is_ddp: bool = False
+                ) -> Tuple[DataLoader, Vocab, int]:
+    """
+    Creates a DataLoader for either the IMDB dataset or a custom CodeDataset.
+    The collate function handles tokenization, numericalization, and padding.
+    """
     tokenizer = get_tokenizer("basic_english")
-
     specials = ["<unk>", "<pad>"]
     pad_token = "<pad>"
 
-    if data_dir is None:
-        print("Preparing IMDB dataset …")
-        train_iter = IMDB(split="train")
-
-        def yield_tokens(data_iter):
-            for _, txt in data_iter:
-                yield tokenizer(txt)
-
-        vocab = build_vocab_from_iterator(yield_tokens(train_iter), specials=specials)
-        vocab.set_default_index(vocab["<unk>"])
-
-        train_iter = IMDB(split="train")  # reload
-        dataset = [(lbl, txt) for lbl, txt in train_iter if txt.strip()]
-
-        sampler = DistributedSampler(dataset) if is_ddp else None
-        def imdb_collate(batch):
-            texts = []
-            for _, txt in batch:
-                tokens = tokenizer(txt)
-                ids = vocab(tokens)
-                if len(ids) < seq_len:
-                    ids += [vocab[pad_token]] * (seq_len - len(ids))
-                else:
-                    ids = ids[:seq_len]
-                texts.append(torch.tensor(ids, dtype=torch.long))
-            return torch.stack(texts)
-
-        loader = DataLoader(dataset,
-                            batch_size=batch_size,
-                            shuffle=(sampler is None), # Shuffle must be False with a sampler
-                            sampler=sampler,
-                            collate_fn=imdb_collate,
-                            drop_last=True)
-    else:
-        code_ds = CodeDataset(data_dir, tokenizer, seq_len)
-        vocab = build_vocab_from_dataset(code_ds.samples, specials=specials)
+    if data_dir:
+        # --- Custom Code Dataset ---
+        ds = CodeDataset(data_dir, tokenizer, seq_len)
+        vocab = build_vocab_from_iterator(ds.samples, specials=specials)
         vocab.set_default_index(vocab["<unk>"])
         pad_id = vocab[pad_token]
-        
-        sampler = DistributedSampler(code_ds) if is_ddp else None
 
-        loader = DataLoader(code_ds,
-                            batch_size=batch_size,
-                            shuffle=(sampler is None), # Shuffle must be False with a sampler
-                            sampler=sampler,
-                            collate_fn=lambda b: code_collate(b, vocab, seq_len, pad_id),
-                            drop_last=True)
+        def collate_fn(b: List[List[str]]):
+            processed_batch = []
+            for tokens in b:
+                ids = vocab(tokens)
+                if len(ids) < seq_len:
+                    ids += [pad_id] * (seq_len - len(ids))
+                else:
+                    ids = ids[:seq_len]
+                processed_batch.append(torch.tensor(ids, dtype=torch.long))
+            return torch.stack(processed_batch)
 
-    print(f"Vocab size: {len(vocab)}")
-    return loader, vocab, vocab[pad_token]
-
-# --- 6‑I. CLI & entry‑point --------------------------------------------------
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Train a diffusion model for (code) text generation.")
-    parser.add_argument("--epochs", type=int, default=epochs)
-    parser.add_argument("--steps", type=int, default=steps_per_epoch)
-    parser.add_argument("--lr", type=float, default=learning_rate)
-    parser.add_argument("--grad-clip", type=float, default=1.0)
-    parser.add_argument("--grad-accum", type=int, default=1)
-    parser.add_argument("--schedule", choices=["linear", "cosine"], default="linear")
-    parser.add_argument("--data-dir", type=str, default=None,
-                        help="Root directory containing code files. "
-                             "If omitted, IMDB text dataset is used.")
-    parser.add_argument("--resume", type=str, default=None)
-    parser.add_argument("--num-layers", type=int, default=num_layers)
-    parser.add_argument("--num-heads", type=int, default=num_heads)
-    parser.add_argument("--dim-ff", type=int, default=dim_feedforward)
-    parser.add_argument("--ema-decay", type=float, default=0.999)
-    parser.add_argument("--sample-every", type=int, default=10,
-                        help="Save CKPT & sample every N epochs")
-    parser.add_argument("--use-ema", action="store_true", help="Enable EMA tracking")
-    parser.add_argument("--amp", action="store_true", help="Enable mixed precision")
-    args = parser.parse_args()
-
-    # --- DDP Setup ---
-    is_ddp = 'WORLD_SIZE' in os.environ
-    if is_ddp:
-        # These are set by torchrun
-        rank = int(os.environ["RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
-        local_rank = int(os.environ["LOCAL_RANK"])
-        
-        dist.init_process_group("nccl")
-        # The device for this process is the local rank
-        device = torch.device(f"cuda:{local_rank}")
-        torch.cuda.set_device(device)
-        print(f"[Process {rank}] Initialized on device {device}.")
     else:
-        rank = 0
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Running on single device: {device}")
+        # --- IMDB Dataset ---
+        imdb_data = [(label, text) for label, text in IMDB(split="train") if text.strip()]
 
+        def yield_tokens(data_iter):
+            for _, text in data_iter:
+                yield tokenizer(text)
 
-    # ---------- Data ----------
-    loader, vocab, pad_id = prepare_data_loader(
-        batch_size, sequence_length, args.data_dir, is_ddp=is_ddp
+        vocab = build_vocab_from_iterator(yield_tokens(imdb_data), specials=specials)
+        vocab.set_default_index(vocab["<unk>"])
+        pad_id = vocab[pad_token]
+        ds = imdb_data
+
+        def collate_fn(b: List[Tuple[int, str]]):
+            processed_batch = []
+            for _, text in b:
+                ids = vocab(tokenizer(text))
+                if len(ids) < seq_len:
+                    ids += [pad_id] * (seq_len - len(ids))
+                else:
+                    ids = ids[:seq_len]
+                processed_batch.append(torch.tensor(ids, dtype=torch.long))
+            return torch.stack(processed_batch)
+
+    sampler = DistributedSampler(ds, shuffle=True) if is_ddp else None
+
+    loader = DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=(sampler is None),
+        sampler=sampler,
+        collate_fn=collate_fn,
+        drop_last=True,
     )
-    vocab_size_actual = len(vocab)
+    # Attach vocab to the dataset for easy access during sampling
+    loader.dataset.vocab = vocab
+    return loader, vocab, pad_id
 
-    # ---------- Model ----------
-    model = DiffusionTransformerPE(
-        vocab_size=vocab_size_actual,
-        hidden_size=hidden_size,
-        num_layers=args.num_layers,
-        num_heads=args.num_heads,
-        dim_feedforward=args.dim_ff,
-        max_seq_len=sequence_length,
-        pad_id=pad_id
-    ).to(device)
+# 6‑I. CLI / entry‑point ------------------------------------------------------
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--epochs", type=int, default=epochs)
+    p.add_argument("--steps", type=int, default=steps_per_epoch)
+    p.add_argument("--batch_size", type=int, default=batch_size)
+    p.add_argument("--sequence_length", type=int, default=sequence_length)
+    p.add_argument("--learning_rate", type=float, default=learning_rate)
+    p.add_argument("--schedule", choices=["linear","cosine"], default="linear")
+    p.add_argument("--sampler", choices=["ddpm","ddim"], default="ddpm")
+    p.add_argument("--ddim-steps", type=int, default=50)
+    p.add_argument("--ddim-eta", type=float, default=0.0)
+    p.add_argument("--grad-clip", type=float, default=1.0)
+    p.add_argument("--grad-accum", type=int, default=1)
+    p.add_argument("--amp", action="store_true")
+    p.add_argument("--use-ema", action="store_true")
+    p.add_argument("--data-dir", type=str, default=None)
+    p.add_argument("--ckpt-dir", type=str, default="checkpoints")
+    p.add_argument("--model", type=str, default="diffllm_v3")
+    p.add_argument("--phase", choices=["train", "generate"], default="train")
+    args = p.parse_args()
 
-    # --- Wrap model for DDP ---
+    # DDP setup ---------------------------------------------------------------
+    is_ddp = "WORLD_SIZE" in os.environ
+    if is_ddp:
+        dist.init_process_group("nccl")
+        local_rank = int(os.environ["LOCAL_RANK"])
+        device = torch.device(f"cuda:{local_rank}"); torch.cuda.set_device(device)
+    else:
+        local_rank = 0
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # data --------------------------------------------------------------------
+    loader, vocab, pad_id = make_loader(args.batch_size, args.sequence_length, args.data_dir, is_ddp)
+    vsize = len(vocab)
+
+    # model -------------------------------------------------------------------
+    model = DiffusionTransformerPE(vsize, hidden_size, num_layers, num_heads,
+                                   dim_feedforward, args.sequence_length, pad_id).to(device)
     if is_ddp:
         model = DDP(model, device_ids=[local_rank])
-        print(f"[Process {rank}] Wrapped model with DDP.")
+
+    # This is the crucial change: EMA is initialized *after* DDP wrapping
+    ema = EMA(model) if args.use_ema else None
+    if local_rank == 0 and ema:
+        print("EMA initialized.")
 
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    alphas_cumprod = get_noise_schedule_v2(
-        num_timesteps, schedule=args.schedule, device=device
-    )
+    opt = optim.Adam(model.parameters(), lr=args.learning_rate)
+    acp = get_noise_schedule_v2(num_timesteps, args.schedule, device)
 
-    # ---------- EMA ----------
-    # EMA should only track on the main process
-    if rank == 0 and args.use_ema:
-        ema = EMA(model.module if is_ddp else model, decay=args.ema_decay)
-    else:
-        ema = None
+    sampler_cfg = {"kind": args.sampler,
+                   "every": 10,
+                   "extra": {"steps": args.ddim_steps, "eta": args.ddim_eta}}
 
-    # ---------- Resume? ----------
-    if args.resume:
-        ckpt = torch.load(args.resume, map_location=device)
-        # When loading, we load into the unwrapped model
-        model_to_load = model.module if is_ddp else model
-        model_to_load.load_state_dict(ckpt["model_state"])
-        optimizer.load_state_dict(ckpt["optimizer_state"])
-        print(f"Resumed from {args.resume} (epoch {ckpt['epoch']})")
+    if args.phase == "train":
+        train(model, criterion, opt, args.epochs, args.steps,
+              loader, acp, ema, device, args.amp, sampler_cfg, is_ddp,
+              args.ckpt_dir, args)
+    elif args.phase == "generate":
+        # Placeholder for generation logic
+        pass
 
-    # ---------- Train ----------
-    # Only the main process should print headers
-    if rank == 0:
-        print("\n--- Starting Training ---")
-
-    train_improved(
-        model=model,
-        criterion=criterion,
-        optimizer=optimizer,
-        epochs=args.epochs,
-        steps_per_epoch=args.steps,
-        grad_clip=args.grad_clip,
-        grad_accum=args.grad_accum,
-        ckpt_dir="checkpoints",
-        amp=args.amp,
-        pad_id=pad_id,
-        alphas_cumprod=alphas_cumprod,
-        train_loader=loader,
-        vocab=vocab,
-        ema=ema,
-        sample_every=args.sample_every,
-        args=args, # Pass args to be saved in checkpoint
-        device=device,
-        is_ddp=is_ddp,
-    )
-    
     if is_ddp:
         dist.destroy_process_group()
 

@@ -1,4 +1,4 @@
-# Diffusion-based Text/Code Generator
+# Diffusion-based Text/Code Generator (v3)
 
 This project is an advanced, research-grade framework for training diffusion-based models for text and code generation using PyTorch. It has evolved from a simple proof-of-concept into a flexible, powerful tool incorporating several state-of-the-art techniques.
 
@@ -6,10 +6,16 @@ The model learns to reverse a "noising" process. It starts with pure Gaussian no
 
 ## Key Features
 
-- **State-of-the-Art Architecture**: Uses a **Transformer Encoder** (the backbone of models like GPT and BERT) instead of a traditional LSTM, allowing for a much better understanding of long-range dependencies in the data.
-- **Distributed Training**: Supports multi-GPU training out-of-the-box using PyTorch's `DistributedDataParallel` (DDP) and the `torchrun` launcher for significant speedups.
-- **Advanced Training Techniques**:
+- **State-of-the-Art Architecture**:
+    - **Transformer Backbone**: Uses a `TransformerEncoder` (the backbone of models like GPT and BERT) for a much better understanding of long-range dependencies in the data.
+    - **Learned Positional Encodings**: Replaces static sinusoidal positional encodings with `nn.Embedding`-based learned positions for potentially better performance.
+    - **Padding-Awareness**: The Transformer correctly ignores padding tokens in the input sequence, leading to more stable and accurate training.
+- **Advanced Diffusion Techniques**:
+    - **Self-Conditioning**: Improves sample quality by feeding the model's prediction of the clean data (`x0`) from the previous timestep back into the next one.
+    - **DDIM Sampling**: Includes an implementation of Denoising Diffusion Implicit Models (DDIM), allowing for much faster sampling in as few as 50 steps instead of 1000, with comparable quality.
     - **Cosine Noise Schedule**: Implements the improved noise schedule from Nichol & Dhariwal's "Improved DDPM" paper for potentially higher-quality results.
+- **Robust and Scalable Training**:
+    - **Distributed Training**: Supports multi-GPU training out-of-the-box using PyTorch's `DistributedDataParallel` (DDP) and the `torchrun` launcher for significant speedups.
     - **Exponential Moving Average (EMA)**: Keeps a "shadow" copy of the model with smoothed weights, which often leads to more stable and better-performing samples.
     - **Gradient Accumulation**: Allows for training with effective batch sizes larger than what can fit in GPU memory.
     - **Mixed-Precision Training**: Uses `torch.cuda.amp` to accelerate training on modern NVIDIA GPUs.
@@ -17,7 +23,7 @@ The model learns to reverse a "noising" process. It starts with pure Gaussian no
     - Can train on the standard `IMDB` text dataset by default.
     - Includes a custom `CodeDataset` that can recursively scan a directory and train on any source code files (`.py`, `.go`, `.js`, etc.), allowing the model to learn code generation.
 - **Modular and Usable**:
-    - **Separate Training and Inference**: `main.py` handles training, while `generate.py` provides a clean, dedicated script for generating samples from saved checkpoints.
+    - **Phased Execution**: `main.py` now handles both training (`--phase train`) and generation (`--phase generate`), providing a single entry point.
     - **Automated Experiment Runner**: `run_code_gen_experiment.sh` provides a one-command way to run a full end-to-end experiment: train the model and immediately generate samples from the final checkpoint.
     - **Self-Contained Checkpoints**: Model checkpoints save the training hyperparameters, allowing for easy and accurate model reconstruction during inference.
 
@@ -25,7 +31,7 @@ The model learns to reverse a "noising" process. It starts with pure Gaussian no
 
 1.  **Clone the repository:**
     ```bash
-    git clone diffllm
+    git clone https://github.com/theapemachine/diffllm.git
     cd diffllm
     ```
 
@@ -36,15 +42,11 @@ The model learns to reverse a "noising" process. It starts with pure Gaussian no
     ```
 
 3.  **Install Dependencies:**
-    This project requires PyTorch and TorchText. The most reliable way to install them is to first uninstall any existing versions and then install compatible ones from the official PyTorch channel.
+    This project requires PyTorch and TorchText.
 
     ```bash
-    # Uninstall any old versions first
-    pip uninstall -y torch torchtext
-
-    # Install compatible versions (for CUDA 12.1)
-    # Visit https://pytorch.org/get-started/locally/ for other CUDA versions or CPU-only install.
-    pip install --no-cache-dir torch torchtext --index-url https://download.pytorch.org/whl/cu121
+    # For CUDA 12.1 - visit https://pytorch.org/get-started/locally/ for other versions
+    pip install torch torchtext --index-url https://download.pytorch.org/whl/cu121
     ```
 
 ## How to Use
@@ -53,13 +55,13 @@ The model learns to reverse a "noising" process. It starts with pure Gaussian no
 
 The `main.py` script is the entry point for training. You can train on the default IMDB dataset or on a directory of code.
 
-**Example: Train on the IMDB dataset (single GPU)**
+**Example: Train on IMDB using DDIM sampler (single GPU)**
 ```bash
-python main.py --epochs 100 --use-ema --amp
+python main.py --epochs 50 --use-ema --amp --sampler ddim --ddim-steps 100
 ```
 
 **Example: Train on a local code directory (multi-GPU)**
-The `run_code_gen_experiment.sh` script is pre-configured to handle this. Simply edit the `GPUS_TO_USE` and `DATA_DIR` variables in the script, then make it executable and run it.
+The `run_code_gen_experiment.sh` script is pre-configured for this. Simply edit the `DATA_DIR` variable in the script, then make it executable and run it.
 
 ```bash
 # First, make the script executable
@@ -68,31 +70,32 @@ chmod +x run_code_gen_experiment.sh
 # Run the end-to-end experiment
 ./run_code_gen_experiment.sh
 ```
-This will train the model on the specified code and automatically run the generation script with the final checkpoint.
+This will train the model on the specified code and save checkpoints to the `checkpoints/` directory.
 
 ### Generating Samples
 
-Once you have a trained checkpoint file (e.g., in the `checkpoints/` directory), you can use `generate.py` to create new samples on demand.
+Once you have a trained checkpoint, use the `generate.py` script to create new samples.
 
 ```bash
 # Generate 5 samples from a specific checkpoint
 python generate.py --checkpoint checkpoints/model_epoch_100.pt --num-samples 5
 ```
-The script will automatically load the model with the correct hyperparameters that were saved in the checkpoint file.
+The script automatically loads the model with the correct hyperparameters saved in the checkpoint file.
 
 ## Command-Line Arguments
 
-Both scripts support a number of arguments. Use the `-h` flag to see all options.
+The `main.py` script supports a number of arguments. Use the `-h` flag to see all options.
 
-### `main.py` (Training)
 - `--data-dir`: Path to a directory of code files. If not provided, uses the IMDB dataset.
+- `--phase`: Set to `train` or `generate`.
 - `--epochs`: Number of epochs to train for.
+- `--learning_rate`: The learning rate for the Adam optimizer.
 - `--schedule`: Noise schedule to use (`linear` or `cosine`).
+- `--sampler`: Sampler to use for generating images during training (`ddpm` or `ddim`).
+- `--ddim-steps`: Number of steps for the DDIM sampler.
+- `--grad-clip`: Maximum norm for gradient clipping.
+- `--grad-accum`: Number of steps to accumulate gradients over.
 - `--use-ema`: Enable Exponential Moving Average of model weights.
 - `--amp`: Enable Automatic Mixed Precision for faster training.
-- `--num-layers`, `--num-heads`, `--dim-ff`: Control the Transformer architecture.
-
-### `generate.py` (Inference)
-- `--checkpoint`: (Required) Path to the saved model checkpoint `.pt` file.
-- `--num-samples`: Number of samples to generate.
-- `--batch-size`: Batch size to use for generation.
+- `--model`: Name of the model and tokenizer files.
+- `--ckpt-dir`: Directory to save checkpoints.

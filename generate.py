@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ================================================================
-#  Diffusion-based Text Generator -- Inference Script
+#  Diffusion-based Text Generator -- v3 Inference Script
 # ================================================================
 
 import argparse
@@ -8,49 +8,33 @@ from pathlib import Path
 
 import torch
 
-# --- We need to import the model and sampler definitions from main.py ---
-# This is a common practice for separating training and inference code.
+# --- Import all necessary components from the new main.py ---
 from main import (
     DiffusionTransformerPE,
-    DiffusionSampler,
+    DDPM_Sampler,
+    DDIM_Sampler,
     get_noise_schedule_v2,
     set_seed,
-    device,
-    prepare_data_loader,
-    hidden_size,       # Use some defaults from main
+    make_loader,
+    hidden_size,
     sequence_length,
     num_timesteps,
-    batch_size,
 )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Generate text samples from a trained diffusion model."
-    )
-    parser.add_argument(
-        "--checkpoint",
-        type=str,
-        required=True,
-        help="Path to the model checkpoint (.pt) file.",
-    )
-    parser.add_argument(
-        "--num-samples",
-        type=int,
-        default=5,
-        help="Number of independent samples to generate.",
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=batch_size,
-        help="Batch size for generation (can be larger than training batch size).",
-    )
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description="Generate text from a trained diffusion model.")
+    p.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint (.pt).")
+    p.add_argument("--num-samples", type=int, default=5, help="Number of samples to generate.")
+    p.add_argument("--sampler", choices=["ddpm", "ddim"], default="ddim", help="Which sampler to use.")
+    p.add_argument("--ddim-steps", type=int, default=50, help="Number of steps for DDIM sampler.")
+    p.add_argument("--ddim-eta", type=float, default=0.0, help="Eta value for DDIM sampler.")
+    args = p.parse_args()
 
     set_seed()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # --- 1. Load Checkpoint and Vocab ---
+    # --- 1. Load Checkpoint and Rebuild Vocab ---
     print(f"Loading checkpoint from: {args.checkpoint}")
     ckpt_path = Path(args.checkpoint)
     if not ckpt_path.is_file():
@@ -59,24 +43,24 @@ def main() -> None:
     ckpt = torch.load(ckpt_path, map_location=device)
     train_args = ckpt["args"]
 
-    # The vocabulary depends on the dataset used during training.
-    # We re-run prepare_data_loader to get the correct vocab.
     print("Rebuilding vocabulary from original dataset...")
-    _, vocab, pad_id = prepare_data_loader(
-        batch_size=args.batch_size,
-        seq_len=sequence_length,
+    loader, _, _ = make_loader(
+        batch_size=1,  # Only need a batch size of 1 for vocab
+        L=sequence_length,
         data_dir=train_args.data_dir,
     )
+    vocab = loader.dataset.vocab
+    pad_id = vocab["<pad>"]
 
-    # --- 2. Reconstruct the Model Architecture ---
+    # --- 2. Reconstruct Model from Saved Args ---
     print("Reconstructing model from saved hyperparameters...")
     model = DiffusionTransformerPE(
         vocab_size=len(vocab),
-        hidden_size=hidden_size,
-        num_layers=train_args.num_layers,
-        num_heads=train_args.num_heads,
-        dim_feedforward=train_args.dim_ff,
-        max_seq_len=sequence_length,
+        hidden=hidden_size,
+        layers=train_args.num_layers,
+        heads=train_args.num_heads,
+        ff=train_args.dim_ff,
+        max_len=sequence_length,
         pad_id=pad_id,
     ).to(device)
 
@@ -84,27 +68,34 @@ def main() -> None:
     model.eval()
     print("Model loaded successfully.")
 
-    # --- 3. Generate Samples ---
+    # --- 3. Instantiate Sampler ---
     alphas_cumprod = get_noise_schedule_v2(
-        num_timesteps, schedule=train_args.schedule
+        num_timesteps, schedule=train_args.schedule, device=device
     )
-    sampler = DiffusionSampler(model, alphas_cumprod, num_timesteps)
 
-    print(f"\n--- Generating {args.num_samples} samples ---")
-    for i in range(args.num_samples):
-        # Generate a batch of samples
-        _, sample_tokens = sampler.sample(
-            batch_size=1,  # Generate one sample at a time
-            seq_len=sequence_length,
-            return_tokens=True,
+    if args.sampler == "ddim":
+        print(f"Using DDIM sampler with {args.ddim_steps} steps.")
+        sampler = DDIM_Sampler(
+            model, alphas_cumprod, num_timesteps, device,
+            steps=args.ddim_steps,
+            eta=args.ddim_eta
         )
+    else:
+        print("Using DDPM sampler.")
+        sampler = DDPM_Sampler(model, alphas_cumprod, num_timesteps, device)
 
-        # Decode the tokens into human-readable text
-        token_list = sample_tokens.squeeze().tolist()
-        text_sample = " ".join(vocab.lookup_tokens(token_list))
 
-        # Clean up the output for readability
+    # --- 4. Generate Samples ---
+    print(f"\n--- Generating {args.num_samples} samples using '{args.sampler.upper()}' sampler ---")
+    for i in range(args.num_samples):
+        # Generate a single sample
+        sample_tokens = sampler.sample(B=1, L=sequence_length)
+        sample_tokens = sample_tokens.squeeze(0)  # Remove batch dimension
+
+        # Decode and print
+        text_sample = " ".join(vocab.lookup_tokens(sample_tokens.tolist()))
         cleaned_text = text_sample.replace("<pad>", "").strip()
+
         print(f"\nSample {i + 1}:\n---\n{cleaned_text}\n---")
 
 
