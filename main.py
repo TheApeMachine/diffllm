@@ -24,23 +24,6 @@ from torchtext.datasets import IMDB
 from torchtext.data.utils import get_tokenizer
 from torchtext.vocab import build_vocab_from_iterator, Vocab
 
-# Set OMP_NUM_THREADS to a reasonable value to avoid torch.distributed.run warning
-# and potentially improve performance on multi-core systems.
-# See: https://discuss.pytorch.org/t/how-to-set-omp-num-threads-for-distruted-training/143234/6
-if "OMP_NUM_THREADS" not in os.environ:
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
-    try:
-        # On Linux, sched_getaffinity is the most reliable way to get available cores.
-        num_cores = len(os.sched_getaffinity(0))
-    except (AttributeError, FileNotFoundError):
-        # Fallback for other systems.
-        num_cores = os.cpu_count()
-
-    if num_cores:
-        # Ensure at least one thread per process.
-        threads_per_proc = max(1, num_cores // world_size)
-        os.environ["OMP_NUM_THREADS"] = str(threads_per_proc)
-
 # ----------------------------------------------------------------
 # 0. Reproducibility helpers
 # ----------------------------------------------------------------
