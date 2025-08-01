@@ -41,6 +41,12 @@ def main() -> None:
         raise FileNotFoundError(f"Checkpoint not found at {ckpt_path}")
 
     ckpt = torch.load(ckpt_path, map_location=device)
+    
+    # Handle old checkpoint format compatibility
+    if "args" not in ckpt:
+        raise ValueError(f"Checkpoint {ckpt_path} is missing 'args' key. "
+                        f"This might be from an older format or corrupted. "
+                        f"Available keys: {list(ckpt.keys())}")
     train_args = ckpt["args"]
 
     # Load cached vocabulary from checkpoint instead of rebuilding

@@ -6,6 +6,7 @@
 import math
 import os
 import random
+import re
 import argparse
 import time
 import inspect
@@ -245,6 +246,54 @@ class DDIM_Sampler(nn.Module):
         tok = embeddings_to_tokens(x, self.model.embedding.weight)
         return tok
 
+# 6‑F. Checkpoint utilities -----------------------------------------------
+def find_latest_checkpoint(ckpt_dir: str) -> Optional[Path]:
+    """Find the latest checkpoint file by epoch number."""
+    ckpt_path = Path(ckpt_dir)
+    if not ckpt_path.exists():
+        return None
+    
+    checkpoint_files = list(ckpt_path.glob("model_epoch*.pt"))
+    if not checkpoint_files:
+        return None
+    
+    # Extract epoch numbers and find the highest one
+    latest_epoch = -1
+    latest_file = None
+    for ckpt_file in checkpoint_files:
+        # Extract epoch number from filename like "model_epoch010.pt"
+        match = re.search(r'model_epoch(\d+)\.pt$', ckpt_file.name)
+        if match:
+            epoch_num = int(match.group(1))
+            if epoch_num > latest_epoch:
+                latest_epoch = epoch_num
+                latest_file = ckpt_file
+    
+    return latest_file
+
+def load_checkpoint(ckpt_path: Path, model, optimizer, ema, device, is_ddp: bool):
+    """Load checkpoint and return the epoch to resume from."""
+    print(f"Loading checkpoint from: {ckpt_path}")
+    checkpoint = torch.load(ckpt_path, map_location=device)
+    
+    # Load model state
+    model_to_load = model.module if is_ddp else model
+    model_to_load.load_state_dict(checkpoint['model_state'])
+    
+    # Load optimizer state
+    optimizer.load_state_dict(checkpoint['optimizer_state'])
+    
+    # Load EMA state if available
+    if ema and 'ema_state' in checkpoint:
+        ema.shadow = checkpoint['ema_state']
+        print("EMA state loaded from checkpoint.")
+    elif ema:
+        print("Warning: EMA enabled but no EMA state found in checkpoint.")
+    
+    resume_epoch = checkpoint['epoch'] + 1
+    print(f"Resuming training from epoch {resume_epoch}")
+    return resume_epoch
+
 # 6‑G. Trainer with self‑conditioning ----------------------------------------
 def train(model, criterion, opt, epochs, steps_ep, loader, acp, ema, device, amp, sampler_cfg, is_ddp, ckpt_dir: str, args: argparse.Namespace):
 
@@ -256,7 +305,22 @@ def train(model, criterion, opt, epochs, steps_ep, loader, acp, ema, device, amp
     grad_clip = args.grad_clip
     grad_accum = args.grad_accum
 
-    for ep in range(1, epochs + 1):
+    # Handle checkpoint resuming
+    start_epoch = 1
+    if args.resume and rank == 0:  # Only main process checks for checkpoints
+        latest_ckpt = find_latest_checkpoint(ckpt_dir)
+        if latest_ckpt:
+            start_epoch = load_checkpoint(latest_ckpt, model, opt, ema, device, is_ddp)
+        else:
+            print("No checkpoint found for resuming. Starting from epoch 1.")
+    
+    # Broadcast start_epoch to all processes in DDP
+    if is_ddp:
+        start_epoch_tensor = torch.tensor(start_epoch, device=device)
+        dist.broadcast(start_epoch_tensor, 0)
+        start_epoch = start_epoch_tensor.item()
+
+    for ep in range(start_epoch, epochs + 1):
         model.train()
         running = 0
         tic = time.time()
@@ -308,14 +372,20 @@ def train(model, criterion, opt, epochs, steps_ep, loader, acp, ema, device, amp
                 # --- Save Checkpoint ---
                 mdl = model.module if is_ddp else model
                 ckpt_file = ckpt_path / f"model_epoch{ep:03}.pt"
-                torch.save(
-                    {"epoch": ep,
-                     "model_state": mdl.state_dict(),
-                     "optimizer_state": opt.state_dict(),
-                     "vocab": loader.dataset.vocab,  # Cache vocab to avoid rebuilding
-                     "args": args},
-                    ckpt_file
-                )
+                # Prepare checkpoint data
+                checkpoint_data = {
+                    "epoch": ep,
+                    "model_state": mdl.state_dict(),
+                    "optimizer_state": opt.state_dict(),
+                    "vocab": loader.dataset.vocab,  # Cache vocab to avoid rebuilding
+                    "args": args
+                }
+                
+                # Add EMA state if available
+                if ema:
+                    checkpoint_data["ema_state"] = ema.shadow
+                
+                torch.save(checkpoint_data, ckpt_file)
                 print(f" ↳ checkpoint saved: {ckpt_file}")
 
                 # --- Generate Sample ---
@@ -467,6 +537,7 @@ def main():
     p.add_argument("--use-ema", action="store_true")
     p.add_argument("--data-dir", type=str, default=None)
     p.add_argument("--ckpt-dir", type=str, default="checkpoints")
+    p.add_argument("--resume", action="store_true", help="Resume training from latest checkpoint")
 
     p.add_argument("--phase", choices=["train", "generate"], default="train")
     args = p.parse_args()

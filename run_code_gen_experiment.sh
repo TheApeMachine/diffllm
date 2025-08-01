@@ -63,7 +63,8 @@ CUDA_VISIBLE_DEVICES=$GPUS_TO_USE torchrun --nproc_per_node=$NUM_GPUS main.py \
     --amp \
     --sampler "$SAMPLER" \
     --ddim-steps "$DDIM_STEPS" \
-    --ckpt-dir "$CHECKPOINT_DIR"
+    --ckpt-dir "$CHECKPOINT_DIR" \
+    --resume
 
 echo -e "\n--- Training finished successfully! ---"
 
@@ -71,8 +72,13 @@ echo -e "\n--- Training finished successfully! ---"
 # --- 3. Inference Phase ---
 echo -e "\n--- Phase 2: Generating samples from the last checkpoint ---"
 
-# Find the latest checkpoint file in the directory.
-LATEST_CHECKPOINT=$(ls -1 "$CHECKPOINT_DIR"/model_epoch*.pt | sort -V | tail -n 1)
+# Find the latest checkpoint file in the directory using numeric sorting on epoch number.
+# Extract epoch numbers and sort them numerically
+LATEST_CHECKPOINT=$(ls -1 "$CHECKPOINT_DIR"/model_epoch*.pt 2>/dev/null | \
+    sed 's/.*model_epoch\([0-9]*\)\.pt$/\1 &/' | \
+    sort -n | \
+    tail -n 1 | \
+    cut -d' ' -f2)
 
 if [ -z "$LATEST_CHECKPOINT" ]; then
     echo "Error: No checkpoint file found in '$CHECKPOINT_DIR'."
