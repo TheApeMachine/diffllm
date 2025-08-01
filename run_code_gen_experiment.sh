@@ -13,7 +13,7 @@ set -e
 # --- 1. Configuration ---
 EPOCHS=50
 # --- Select the GPUs to use ---
-GPUS_TO_USE="1,2"
+GPUS_TO_USE="1"
 # --- Select the sampler to use ---
 SAMPLER="ddim" # "ddim" or "ddpm"
 DDIM_STEPS=50  # Only used if sampler is "ddim"
@@ -30,17 +30,33 @@ echo "--- Phase 1: Training v3 model on code from '$DATA_DIR' for $EPOCHS epochs
 echo "This will take a while..."
 
 # Calculate and set OMP_NUM_THREADS to avoid DDP warnings and improve performance.
-# This logic divides available cores among the processes.
-NUM_GPUS=$(echo $GPUS_TO_USE | awk -F, '{print NF}')
-CPU_CORES=$(nproc)
+# This logic divides available CPU cores among GPU processes to prevent oversubscription.
+# Each GPU process gets dedicated CPU cores for optimal NUMA performance.
+NUM_GPUS=1
+CPU_CORES=4
 THREADS_PER_PROC=$((CPU_CORES / NUM_GPUS))
 export OMP_NUM_THREADS=$THREADS_PER_PROC
+
+# Validate GPU configuration matches torchrun expectations
+ACTUAL_GPU_COUNT=$(echo $GPUS_TO_USE | tr ',' '\n' | wc -l)
+if [ "$ACTUAL_GPU_COUNT" -ne "$NUM_GPUS" ]; then
+    echo "Error: GPU count mismatch!"
+    echo "  GPUS_TO_USE contains $ACTUAL_GPU_COUNT GPUs: $GPUS_TO_USE"
+    echo "  NUM_GPUS is set to: $NUM_GPUS"
+    echo "  These must match for torchrun to work correctly."
+    exit 1
+fi
+
+CUDA_LAUNCH_BLOCKING=1
+TORCH_SHOW_CPP_STACKTRACES=1
+
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+export TORCH_NCCL_BLOCKING_WAIT=1
 
 # Use torchrun for distributed training.
 # It automatically manages the distributed environment.
 CUDA_VISIBLE_DEVICES=$GPUS_TO_USE torchrun --nproc_per_node=$NUM_GPUS main.py \
     --phase train \
-    --model "$MODEL_NAME" \
     --data-dir "$DATA_DIR" \
     --epochs "$EPOCHS" \
     --use-ema \
@@ -56,7 +72,7 @@ echo -e "\n--- Training finished successfully! ---"
 echo -e "\n--- Phase 2: Generating samples from the last checkpoint ---"
 
 # Find the latest checkpoint file in the directory.
-LATEST_CHECKPOINT=$(ls -1 "$CHECKPOINT_DIR"/model_epoch_*.pt | sort -V | tail -n 1)
+LATEST_CHECKPOINT=$(ls -1 "$CHECKPOINT_DIR"/model_epoch*.pt | sort -V | tail -n 1)
 
 if [ -z "$LATEST_CHECKPOINT" ]; then
     echo "Error: No checkpoint file found in '$CHECKPOINT_DIR'."

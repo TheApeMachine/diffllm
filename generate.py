@@ -34,7 +34,7 @@ def main() -> None:
     set_seed()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # --- 1. Load Checkpoint and Rebuild Vocab ---
+    # --- 1. Load Checkpoint and Vocab ---
     print(f"Loading checkpoint from: {args.checkpoint}")
     ckpt_path = Path(args.checkpoint)
     if not ckpt_path.is_file():
@@ -43,13 +43,18 @@ def main() -> None:
     ckpt = torch.load(ckpt_path, map_location=device)
     train_args = ckpt["args"]
 
-    print("Rebuilding vocabulary from original dataset...")
-    loader, _, _ = make_loader(
-        batch_size=1,  # Only need a batch size of 1 for vocab
-        L=sequence_length,
-        data_dir=train_args.data_dir,
-    )
-    vocab = loader.dataset.vocab
+    # Load cached vocabulary from checkpoint instead of rebuilding
+    if "vocab" in ckpt:
+        print("Loading cached vocabulary from checkpoint...")
+        vocab = ckpt["vocab"]
+    else:
+        print("Warning: No cached vocab found. Rebuilding from dataset...")
+        loader, _, _ = make_loader(
+            batch_size=1,  # Only need a batch size of 1 for vocab
+            seq_len=sequence_length,
+            data_dir=train_args.data_dir,
+        )
+        vocab = loader.dataset.vocab
     pad_id = vocab["<pad>"]
 
     # --- 2. Reconstruct Model from Saved Args ---

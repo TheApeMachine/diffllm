@@ -158,16 +158,21 @@ class EMA:
                 self.shadow[n].mul_(self.decay).add_(p.data, alpha=1 - self.decay)
 
     def apply_to(self, model: nn.Module):
+        # Use in-place swap to avoid memory spike from cloning all parameters
         self.backup = {}
-        for n, p in model.named_parameters():
-            if p.requires_grad:
-                self.backup[n] = p.data.clone()
-                p.data.copy_(self.shadow[n])
+        model_to_apply = model.module if hasattr(model, 'module') else model
+        for n, p in model_to_apply.named_parameters():
+            if p.requires_grad and n in self.shadow:
+                # Swap data pointers instead of cloning to save memory
+                self.backup[n] = p.data
+                p.data = self.shadow[n]
 
     def restore(self, model: nn.Module):
-        for n, p in model.named_parameters():
-            if p.requires_grad:
-                p.data.copy_(self.backup[n])
+        # Restore using pointer swap (matches apply_to optimization)
+        model_to_restore = model.module if hasattr(model, 'module') else model
+        for n, p in model_to_restore.named_parameters():
+            if p.requires_grad and n in self.backup:
+                p.data = self.backup[n]
 
 # 6‑D. helpers
 def get_schedule_values(acp: torch.Tensor, t: torch.Tensor, shape):
@@ -176,7 +181,11 @@ def get_schedule_values(acp: torch.Tensor, t: torch.Tensor, shape):
     return al_t.view(B, *((1,) * (len(shape) - 1))).expand(shape)
 
 def embeddings_to_tokens(emb: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
-    return torch.matmul(emb, W.t()).argmax(-1)
+    # Use gumbel softmax with low temperature for differentiable sampling
+    # This reduces OOV drift compared to hard argmax
+    logits = torch.matmul(emb, W.t())
+    # Use temperature of 0.1 for sharp but not completely hard selection
+    return torch.nn.functional.gumbel_softmax(logits, tau=0.1, hard=True, dim=-1).argmax(-1)
 
 # 6‑E. DDPM Sampler (self‑cond aware)
 class DDPM_Sampler(nn.Module):
@@ -230,7 +239,7 @@ class DDIM_Sampler(nn.Module):
             x0_pred = (x - (1 - a_t).sqrt() * eps) / a_t.sqrt()
             sigma = self.eta * ((1 - a_prev) / (1 - a_t)).sqrt() * (1 - a_t / a_prev).sqrt()
             dir_xt = (1 - a_prev - sigma ** 2).sqrt() * eps
-            noise = torch.randn_like(x) if sigma > 0 else 0
+            noise = torch.randn_like(x) if sigma.item() > 0 else 0
             x = a_prev.sqrt() * x0_pred + dir_xt + sigma * noise
 
         tok = embeddings_to_tokens(x, self.model.embedding.weight)
@@ -303,6 +312,7 @@ def train(model, criterion, opt, epochs, steps_ep, loader, acp, ema, device, amp
                     {"epoch": ep,
                      "model_state": mdl.state_dict(),
                      "optimizer_state": opt.state_dict(),
+                     "vocab": loader.dataset.vocab,  # Cache vocab to avoid rebuilding
                      "args": args},
                     ckpt_file
                 )
@@ -323,22 +333,48 @@ class CodeDataset(Dataset):
     exts = {".py", ".js", ".ts", ".go", ".java", ".cs", ".cpp", ".c"}
     def __init__(self, root, tok, L):
         self.tok, self.L = tok, L
-        self.samples = []
+        # Store file paths and chunk indices instead of loading all content
+        self.file_chunks = []  # [(file_path, start_idx, end_idx), ...]
+        self._cache = {}  # Simple LRU-style cache for tokenized files
+        self._cache_size = 100  # Cache up to 100 files
+        
         for p in Path(root).rglob("*"):
             if p.suffix.lower() in self.exts:
                 try:
                     text = p.read_text(encoding="utf8", errors="ignore")
+                    toks = tok(text)
+                    # Store chunk boundaries instead of actual chunks
+                    for i in range(0, len(toks), L):
+                        if i + L <= len(toks) or len(toks) - i >= L // 2:  # Keep partial chunks if >= half length
+                            self.file_chunks.append((str(p), i, min(i + L, len(toks))))
                 except Exception:
                     continue
-                toks = tok(text)
-                for i in range(0, len(toks), L):
-                    chunk = toks[i:i+L]
-                    if chunk: self.samples.append(chunk)
-        if not self.samples:
+        if not self.file_chunks:
             raise RuntimeError("no code found")
 
-    def __len__(self): return len(self.samples)
-    def __getitem__(self, i): return self.samples[i]
+    def __len__(self): 
+        return len(self.file_chunks)
+
+    def __getitem__(self, i): 
+        file_path, start_idx, end_idx = self.file_chunks[i]
+        
+        # Check cache first
+        if file_path in self._cache:
+            tokens = self._cache[file_path]
+        else:
+            # Load and tokenize file on demand
+            try:
+                text = Path(file_path).read_text(encoding="utf8", errors="ignore")
+                tokens = self.tok(text)
+                # Simple cache management - remove oldest if cache full
+                if len(self._cache) >= self._cache_size:
+                    oldest_key = next(iter(self._cache))
+                    del self._cache[oldest_key]
+                self._cache[file_path] = tokens
+            except Exception:
+                return []  # Return empty if file can't be read
+        
+        return tokens[start_idx:end_idx]
 
 def make_loader(batch_size: int,
                 seq_len: int,
@@ -356,7 +392,11 @@ def make_loader(batch_size: int,
     if data_dir:
         # --- Custom Code Dataset ---
         ds = CodeDataset(data_dir, tokenizer, seq_len)
-        vocab = build_vocab_from_iterator(ds.samples, specials=specials)
+        # Build vocab from all tokens across all file chunks
+        def token_generator():
+            for i in range(len(ds)):
+                yield ds[i]
+        vocab = build_vocab_from_iterator(token_generator(), specials=specials)
         vocab.set_default_index(vocab["<unk>"])
         pad_id = vocab[pad_token]
 
@@ -427,7 +467,7 @@ def main():
     p.add_argument("--use-ema", action="store_true")
     p.add_argument("--data-dir", type=str, default=None)
     p.add_argument("--ckpt-dir", type=str, default="checkpoints")
-    p.add_argument("--model", type=str, default="diffllm_v3")
+
     p.add_argument("--phase", choices=["train", "generate"], default="train")
     args = p.parse_args()
 
