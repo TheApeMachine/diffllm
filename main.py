@@ -272,7 +272,7 @@ def find_latest_checkpoint(ckpt_dir: str) -> Optional[Path]:
     return latest_file
 
 def load_checkpoint(ckpt_path: Path, model, optimizer, ema, device, is_ddp: bool):
-    """Load checkpoint and return the epoch to resume from."""
+    """Load checkpoint and return the epoch to resume from, plus the cached vocab."""
     print(f"Loading checkpoint from: {ckpt_path}")
     checkpoint = torch.load(ckpt_path, map_location=device)
     
@@ -290,9 +290,14 @@ def load_checkpoint(ckpt_path: Path, model, optimizer, ema, device, is_ddp: bool
     elif ema:
         print("Warning: EMA enabled but no EMA state found in checkpoint.")
     
+    # Get cached vocab to ensure consistency
+    cached_vocab = checkpoint.get('vocab', None)
+    if cached_vocab:
+        print("Using cached vocabulary from checkpoint to ensure consistency.")
+    
     resume_epoch = checkpoint['epoch'] + 1
     print(f"Resuming training from epoch {resume_epoch}")
-    return resume_epoch
+    return resume_epoch, cached_vocab
 
 # 6‑G. Trainer with self‑conditioning ----------------------------------------
 def train(model, criterion, opt, epochs, steps_ep, loader, acp, ema, device, amp, sampler_cfg, is_ddp, ckpt_dir: str, args: argparse.Namespace):
@@ -310,7 +315,7 @@ def train(model, criterion, opt, epochs, steps_ep, loader, acp, ema, device, amp
     if args.resume and rank == 0:  # Only main process checks for checkpoints
         latest_ckpt = find_latest_checkpoint(ckpt_dir)
         if latest_ckpt:
-            start_epoch = load_checkpoint(latest_ckpt, model, opt, ema, device, is_ddp)
+            start_epoch, _ = load_checkpoint(latest_ckpt, model, opt, ema, device, is_ddp)
         else:
             print("No checkpoint found for resuming. Starting from epoch 1.")
     
@@ -449,7 +454,8 @@ class CodeDataset(Dataset):
 def make_loader(batch_size: int,
                 seq_len: int,
                 data_dir: Optional[str] = None,
-                is_ddp: bool = False
+                is_ddp: bool = False,
+                cached_vocab: Optional = None
                 ) -> Tuple[DataLoader, Vocab, int]:
     """
     Creates a DataLoader for either the IMDB dataset or a custom CodeDataset.
@@ -462,12 +468,20 @@ def make_loader(batch_size: int,
     if data_dir:
         # --- Custom Code Dataset ---
         ds = CodeDataset(data_dir, tokenizer, seq_len)
-        # Build vocab from all tokens across all file chunks
-        def token_generator():
-            for i in range(len(ds)):
-                yield ds[i]
-        vocab = build_vocab_from_iterator(token_generator(), specials=specials)
-        vocab.set_default_index(vocab["<unk>"])
+        
+        # Use cached vocab if provided (from checkpoint), otherwise build fresh
+        if cached_vocab:
+            print("Using provided cached vocabulary (skipping rebuild)")
+            vocab = cached_vocab
+        else:
+            print("Building vocabulary from dataset...")
+            # Build vocab from all tokens across all file chunks
+            def token_generator():
+                for i in range(len(ds)):
+                    yield ds[i]
+            vocab = build_vocab_from_iterator(token_generator(), specials=specials)
+            vocab.set_default_index(vocab["<unk>"])
+        
         pad_id = vocab[pad_token]
 
         def collate_fn(b: List[List[str]]):
@@ -552,8 +566,29 @@ def main():
         local_rank = 0
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # Debug: Check DDP status
+    print(f"DDP setup: is_ddp={is_ddp}, local_rank={local_rank}, resume={args.resume}")
+    
+    # Check for resume first to get correct vocab size ------------
+    resume_vocab = None
+    if args.resume:
+        latest_ckpt = find_latest_checkpoint(args.ckpt_dir)
+        if latest_ckpt:
+            print(f"Found checkpoint for resuming: {latest_ckpt}")
+            checkpoint = torch.load(latest_ckpt, map_location=device)
+            if 'vocab' in checkpoint:
+                resume_vocab = checkpoint['vocab']
+                print(f"Loaded vocab from checkpoint (size: {len(resume_vocab)})")
+            else:
+                print("No vocab found in checkpoint!")
+
     # data --------------------------------------------------------------------
-    loader, vocab, pad_id = make_loader(args.batch_size, args.sequence_length, args.data_dir, is_ddp)
+    print(f"Building data loader...")
+    # Pass cached vocab to make_loader to avoid rebuilding when resuming
+    cached_vocab_to_use = resume_vocab if (args.resume and resume_vocab) else None
+    loader, vocab, pad_id = make_loader(args.batch_size, args.sequence_length, args.data_dir, is_ddp, cached_vocab_to_use)
+    print(f"Final vocab size: {len(vocab)}")
+    
     vsize = len(vocab)
 
     # model -------------------------------------------------------------------

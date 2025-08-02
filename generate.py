@@ -19,6 +19,9 @@ from main import (
     hidden_size,
     sequence_length,
     num_timesteps,
+    num_layers,
+    num_heads,
+    dim_feedforward,
 )
 
 
@@ -68,9 +71,9 @@ def main() -> None:
     model = DiffusionTransformerPE(
         vocab_size=len(vocab),
         hidden=hidden_size,
-        layers=train_args.num_layers,
-        heads=train_args.num_heads,
-        ff=train_args.dim_ff,
+        layers=num_layers,
+        heads=num_heads,
+        ff=dim_feedforward,
         max_len=sequence_length,
         pad_id=pad_id,
     ).to(device)
