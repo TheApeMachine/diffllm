@@ -11,14 +11,14 @@
 set -e
 
 # --- 1. Configuration ---
-EPOCHS=50
+EPOCHS=100
 # --- Select the GPUs to use ---
 GPUS_TO_USE="1"
 # --- Select the sampler to use ---
 SAMPLER="ddim" # "ddim" or "ddpm"
 DDIM_STEPS=50  # Only used if sampler is "ddim"
 # --- Set the data source ---
-DATA_DIR="$HOME/go/src/github.com/theapemachine"
+DATA_DIR="$HOME/go/src/github.com"
 CHECKPOINT_DIR="checkpoints"
 
 
@@ -33,7 +33,7 @@ echo "This will take a while..."
 # This logic divides available CPU cores among GPU processes to prevent oversubscription.
 # Each GPU process gets dedicated CPU cores for optimal NUMA performance.
 NUM_GPUS=1
-CPU_CORES=4
+CPU_CORES=8
 THREADS_PER_PROC=$((CPU_CORES / NUM_GPUS))
 export OMP_NUM_THREADS=$THREADS_PER_PROC
 
