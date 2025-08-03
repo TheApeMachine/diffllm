@@ -67,6 +67,7 @@ CUDA_VISIBLE_DEVICES=$GPUS_TO_USE torchrun --nproc_per_node=$NUM_GPUS main.py \
     --dim-feedforward 3072 \
     --mse-lambda 0.5 \
     --use-ema \
+    --use-lr-scheduler \
     --amp \
     --sampler "$SAMPLER" \
     --ddim-steps "$DDIM_STEPS" \

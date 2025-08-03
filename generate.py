@@ -1,7 +1,7 @@
 
 #!/usr/bin/env python3
 # ================================================================
-#  Diffusion-based Text Generator -- v3 Inference Script
+#  Diffusion-based Text Generator -- v4 Inference Script
 # ================================================================
 
 import argparse
@@ -9,16 +9,14 @@ from pathlib import Path
 import torch
 from tokenizers import Tokenizer
 
-# --- Import all necessary components from the new main.py ---
 from main import (
-    DiffusionTransformerPE,
+    DiffusionTransformer,
     DDPM_Sampler,
     DDIM_Sampler,
     get_noise_schedule_v2,
     set_seed,
-    num_timesteps, # Keep this default
+    num_timesteps,
 )
-
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Generate text from a trained diffusion model.")
@@ -29,7 +27,7 @@ def main() -> None:
     p.add_argument("--ddim-eta", type=float, default=0.0, help="Eta value for DDIM sampler.")
     p.add_argument("--sequence-length", type=int, default=None, help="Override sequence length from training.")
     p.add_argument("--prompt", type=str, default=None, help="Prompt for conditional generation.")
-    p.add_argument("--guidance-scale", type=float, default=7.5, help="Guidance scale for CFG (e.g., 0.0 for unconditional, 7.5 for strong guidance).")
+    p.add_argument("--guidance-scale", type=float, default=7.5, help="Guidance scale for CFG.")
     args = p.parse_args()
 
     set_seed()
@@ -49,7 +47,7 @@ def main() -> None:
 
     tokenizer_path = ckpt.get("tokenizer_path")
     if not tokenizer_path or not Path(tokenizer_path).exists():
-        raise ValueError(f"Tokenizer path not found in checkpoint or file missing: {tokenizer_path}")
+        raise ValueError(f"Tokenizer path not found in checkpoint: {tokenizer_path}")
     
     print(f"Loading tokenizer from: {tokenizer_path}")
     tokenizer = Tokenizer.from_file(tokenizer_path)
@@ -57,11 +55,11 @@ def main() -> None:
     if pad_id is None:
         raise ValueError("Tokenizer must have a <pad> token.")
 
-    # --- 2. Reconstruct Model from Saved Args ---
+    # --- 2. Reconstruct Model ---
     print("Reconstructing model from saved hyperparameters...")
     seq_len = args.sequence_length if args.sequence_length else train_args.sequence_length
     
-    model = DiffusionTransformerPE(
+    model = DiffusionTransformer(
         vocab_size=tokenizer.get_vocab_size(),
         hidden=train_args.hidden_size,
         layers=train_args.num_layers,
@@ -75,28 +73,29 @@ def main() -> None:
     model.eval()
     print("Model loaded successfully.")
 
-    # --- 3. Prepare Prompt Embedding ---
-    prompt_emb = None
+    # --- 3. Prepare Prompt and Masks ---
+    prompt_emb, prompt_pad_mask = None, None
     if args.prompt:
         print(f"Using prompt for conditional generation: '{args.prompt}'")
         prompt_tokens = tokenizer.encode(args.prompt).ids
+        
+        # Pad or truncate prompt
         if len(prompt_tokens) < seq_len:
             prompt_tokens += [pad_id] * (seq_len - len(prompt_tokens))
         else:
             prompt_tokens = prompt_tokens[:seq_len]
         
         prompt_tensor = torch.tensor(prompt_tokens, dtype=torch.long, device=device).unsqueeze(0)
+        prompt_pad_mask = (prompt_tensor == pad_id)
         prompt_emb = model.embedding(prompt_tensor)
-        prompt_emb = prompt_emb.mean(dim=1, keepdim=True).expand(-1, seq_len, -1)
     else:
-        print("Running in unconditional mode (no prompt provided).")
+        print("Running in unconditional mode.")
 
+    # Target padding mask can be None for generation as we generate a full sequence
+    tgt_pad_mask = None
 
     # --- 4. Instantiate Sampler ---
-    alphas_cumprod = get_noise_schedule_v2(
-        num_timesteps, schedule=train_args.schedule, device=device
-    )
-
+    alphas_cumprod = get_noise_schedule_v2(num_timesteps, schedule=train_args.schedule, device=device)
     sampler_args = {"model": model, "acp": alphas_cumprod, "T": num_timesteps, "device": device, "hidden_size": train_args.hidden_size}
     if args.sampler == "ddim":
         print(f"Using DDIM sampler with {args.ddim_steps} steps.")
@@ -105,22 +104,17 @@ def main() -> None:
         print("Using DDPM sampler.")
         sampler = DDPM_Sampler(**sampler_args)
 
-
     # --- 5. Generate Samples ---
     print(f"\n--- Generating {args.num_samples} samples (guidance_scale={args.guidance_scale}) ---")
     for i in range(args.num_samples):
         sample_tokens = sampler.sample(
-            B=1, 
-            L=seq_len, 
-            prompt_emb=prompt_emb, 
+            B=1, L=seq_len, tgt_pad_mask=tgt_pad_mask, 
+            prompt_emb=prompt_emb, prompt_pad_mask=prompt_pad_mask, 
             guidance_scale=args.guidance_scale
         )
         sample_tokens = sample_tokens.squeeze(0)
-
         text_sample = tokenizer.decode(sample_tokens.tolist(), skip_special_tokens=True)
-
         print(f"\nSample {i + 1}:\n---\n{text_sample}\n---")
-
 
 if __name__ == "__main__":
     main()
