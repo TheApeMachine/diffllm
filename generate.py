@@ -111,7 +111,7 @@ def main() -> None:
     for i in range(args.num_samples):
         sample_tokens = sampler.sample(
             B=1, 
-            L=seq_en, 
+            L=seq_len, 
             prompt_emb=prompt_emb, 
             guidance_scale=args.guidance_scale
         )
