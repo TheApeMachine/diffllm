@@ -32,7 +32,7 @@ def train_bpe_tokenizer(data_dir: str, vocab_size: int, output_file: str):
     tokenizer.decoder = MetaspaceDecoder()
 
     # 4. Customize the trainer
-    trainer = BpeTrainer(vocab_size=50000, special_tokens=["<unk>", "<pad>", "<s>", "</s>"])
+    trainer = BpeTrainer(vocab_size=vocab_size, special_tokens=["<unk>", "<pad>", "<s>", "</s>"])
 
     # 5. Train the tokenizer from the iterator
     print(f"Training BPE tokenizer on {len(files)} files...")

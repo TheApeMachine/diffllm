@@ -6,6 +6,7 @@
 
 import math
 import os
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 import random
 import re
 import argparse
@@ -96,7 +97,7 @@ class DiffusionTransformer(nn.Module):
         self.pos_embedding = PositionalEncoding(max_len, hidden)
         self.time_embedding = TimestepEmbedding(hidden)
         self.sc_proj = nn.Linear(hidden, hidden, bias=False)
-        
+
         # Use a TransformerDecoder instead of Encoder
         decoder_layer = nn.TransformerDecoderLayer(d_model=hidden, nhead=heads, dim_feedforward=ff, batch_first=True)
         self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=layers)
@@ -109,18 +110,18 @@ class DiffusionTransformer(nn.Module):
                 prompt_pad_mask: Optional[torch.Tensor] = None
                 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
-        if self_cond is None: 
+        if self_cond is None:
             self_cond = torch.zeros_like(noisy_emb)
-        
+
         # The target sequence for the decoder is the noisy embedding
         tgt = noisy_emb + self.sc_proj(self_cond) + self.pos_embedding(noisy_emb) + self.time_embedding(t).unsqueeze(1)
-        
+
         # The `memory` for the decoder is the prompt embedding.
         # If no prompt, use a zero tensor as memory.
         if prompt_emb is None:
             memory = torch.zeros_like(tgt)
-            # The memory key padding mask should prevent attention to all memory positions
-            memory_key_pad_mask = torch.ones_like(prompt_pad_mask, dtype=torch.bool) if prompt_pad_mask is not None else None
+            # Mask all memory tokens so cross-attn contributes nothing.
+            memory_key_pad_mask = torch.ones((tgt.size(0), tgt.size(1)), device=tgt.device, dtype=torch.bool)
         else:
             memory = prompt_emb + self.pos_embedding(prompt_emb)
             memory_key_pad_mask = prompt_pad_mask
@@ -132,11 +133,35 @@ class DiffusionTransformer(nn.Module):
             tgt_key_padding_mask=tgt_pad_mask,
             memory_key_padding_mask=memory_key_pad_mask
         )
-        
+
         noise_pred, x0_pred = self.head(x).chunk(2, dim=-1)
         logits = torch.matmul(x0_pred, self.embedding.weight.t())
-        
+
         return noise_pred, x0_pred, logits
+
+
+class TokenCollator:
+    """Pickle-safe collate function for DataLoader workers (macOS uses spawn)."""
+
+    def __init__(self, seq_len: int, pad_id: int):
+        self.seq_len = seq_len
+        self.pad_id = pad_id
+
+    def __call__(self, b: List[Tuple[List[int], List[int]]]):
+        targets, prompts = [], []
+        pad = [self.pad_id] * self.seq_len
+
+        for target_ids, prompt_ids in b:
+            if not target_ids or not prompt_ids:
+                continue
+            targets.append(torch.tensor((target_ids + pad)[: self.seq_len], dtype=torch.long))
+            prompts.append(torch.tensor((prompt_ids + pad)[: self.seq_len], dtype=torch.long))
+
+        if not targets:
+            empty = torch.empty((0, self.seq_len), dtype=torch.long)
+            return empty, empty.clone()
+
+        return torch.stack(targets), torch.stack(prompts)
 
 
 def get_noise_schedule_v2(T: int, schedule: str, device, beta_start=1e-4, beta_end=2e-2):
@@ -191,7 +216,7 @@ def get_schedule_values(acp: torch.Tensor, t: torch.Tensor, shape):
 
 def embeddings_to_tokens(emb: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
     logits = torch.matmul(emb, W.t())
-    return F.gumbel_softmax(logits, tau=0.1, hard=True, dim=-1).argmax(-1)
+    return logits.argmax(-1)
 
 class DDPM_Sampler(nn.Module):
     def __init__(self, model, acp, T, device, hidden_size):
@@ -208,10 +233,10 @@ class DDPM_Sampler(nn.Module):
         self_cond = None
         for t_ind in reversed(range(self.T)):
             t = torch.full((B,), t_ind, dtype=torch.long, device=self.device)
-            
+
             eps_cond, x0_cond, _ = self.model(x, t, tgt_pad_mask, self_cond, prompt_emb, prompt_pad_mask)
             eps_uncond, _, _ = self.model(x, t, tgt_pad_mask, self_cond, None, None)
-            
+
             eps = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
             self_cond = x0_cond
 
@@ -228,7 +253,12 @@ class DDIM_Sampler(nn.Module):
         super().__init__()
         self.model, self.device, self.eta, self.hidden_size = model, device, eta, hidden_size
         self.acp = acp
-        self.steps = torch.linspace(0, T - 1, steps, dtype=torch.long)
+        # Choose integer indices spaced across [0, T-1] on the correct device, avoiding duplicates.
+        step_idx = torch.linspace(0, T - 1, steps, device=device)
+        step_idx = torch.unique(step_idx.round().long())
+        if step_idx.numel() < 2:
+            step_idx = torch.tensor([0, T - 1], device=device, dtype=torch.long)
+        self.steps = step_idx
 
     @torch.no_grad()
     def sample(self, B, L, tgt_pad_mask=None, prompt_emb=None, prompt_pad_mask=None, guidance_scale=7.5):
@@ -241,7 +271,7 @@ class DDIM_Sampler(nn.Module):
 
             eps_cond, x0_cond, _ = self.model(x, t_long, tgt_pad_mask, self_cond, prompt_emb, prompt_pad_mask)
             eps_uncond, _, _ = self.model(x, t_long, tgt_pad_mask, self_cond, None, None)
-            
+
             eps = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
             self_cond = x0_cond
 
@@ -273,12 +303,13 @@ def load_checkpoint(ckpt_path: Path, model, optimizer, scheduler, ema, device, i
     return resume_epoch, tokenizer_path
 
 def train(model, opt, scheduler, epochs, steps_ep, loader, acp, ema, device, amp, sampler_cfg, is_ddp, ckpt_dir: str, args: argparse.Namespace, tokenizer: Tokenizer, pad_id: int):
-    scaler = torch.cuda.amp.GradScaler(enabled=amp and device.type == "cuda")
+    use_cuda_amp = bool(amp and device.type == "cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=use_cuda_amp)
     mse_loss_fn = nn.MSELoss()
     data_iter = iter(loader)
     rank = dist.get_rank() if is_ddp else 0
     ckpt_path = Path(ckpt_dir); ckpt_path.mkdir(exist_ok=True)
-    
+
     start_epoch = 1
     if args.resume and rank == 0:
         latest_ckpt = find_latest_checkpoint(ckpt_dir)
@@ -312,16 +343,16 @@ def train(model, opt, scheduler, epochs, steps_ep, loader, acp, ema, device, amp
             underlying_model = model.module if is_ddp else model
             clean_emb = underlying_model.embedding(x_tokens)
             prompt_emb = underlying_model.embedding(prompt_tokens)
-            
+
             unconditional = random.random() < 0.1
-            
+
             sq_a = get_schedule_values(acp.sqrt(), t, clean_emb.shape)
             sq_1ma = get_schedule_values((1 - acp).sqrt(), t, clean_emb.shape)
             noise = torch.randn_like(clean_emb)
             noisy_emb = sq_a * clean_emb + sq_1ma * noise
 
             use_sc = random.random() < 0.5
-            with torch.cuda.amp.autocast(enabled=amp and device.type == "cuda"):
+            with torch.amp.autocast("cuda", enabled=use_cuda_amp):
                 current_prompt_emb = None if unconditional else prompt_emb
                 current_prompt_mask = None if unconditional else prompt_pad_mask
 
@@ -329,7 +360,7 @@ def train(model, opt, scheduler, epochs, steps_ep, loader, acp, ema, device, amp
                 eps, logits = eps1, logits1
                 if use_sc:
                     eps, _, logits = model(noisy_emb, t, tgt_pad_mask, x0_1.detach(), current_prompt_emb, current_prompt_mask)
-                
+
                 loss_mse = mse_loss_fn(eps, noise)
                 loss_ce = F.cross_entropy(logits.view(-1, logits.size(-1)), x_tokens.view(-1), ignore_index=pad_id)
                 loss = (args.mse_lambda * loss_mse + (1 - args.mse_lambda) * loss_ce) / args.grad_accum
@@ -352,50 +383,72 @@ def train(model, opt, scheduler, epochs, steps_ep, loader, acp, ema, device, amp
             print(f"Epoch {ep:03}/{epochs:03} Loss={avg_loss:.4f} (MSE:{avg_mse:.4f}, CE:{avg_ce:.4f}) LR={opt.param_groups[0]['lr']:.2e} {time.time()-tic:.1f}s")
 
             if ep % sampler_cfg["every"] == 0 or ep == epochs:
-                mdl = model.module if is_ddp else mdl
+                mdl = model.module if is_ddp else model
                 ckpt_data = {
                     "epoch": ep, "model_state": mdl.state_dict(), "optimizer_state": opt.state_dict(),
                     "tokenizer_path": args.tokenizer_file, "args": args,
                 }
                 if scheduler: ckpt_data["scheduler_state"] = scheduler.state_dict()
                 if ema: ckpt_data["ema_state"] = ema.shadow
-                
+
                 torch.save(ckpt_data, ckpt_path / f"model_epoch{ep:03}.pt")
                 print(f" ↳ checkpoint saved")
 
                 if ema: ema.apply_to(mdl)
-                sampler = (DDIM_Sampler if sampler_cfg["kind"] == "ddim" else DDPM_Sampler)(
-                    mdl, acp, num_timesteps, device, args.hidden_size, **sampler_cfg.get("extra", {})
-                )
+                sampler_cls = DDIM_Sampler if sampler_cfg["kind"] == "ddim" else DDPM_Sampler
+                sampler_extra = sampler_cfg.get("extra", {}) if sampler_cfg["kind"] == "ddim" else {}
+                sampler = sampler_cls(mdl, acp, num_timesteps, device, args.hidden_size, **sampler_extra)
                 sample = sampler.sample(1, args.sequence_length, prompt_emb=prompt_emb[:1], prompt_pad_mask=prompt_pad_mask[:1], guidance_scale=args.guidance_scale)[0]
                 print(" ↳ sample:", tokenizer.decode(sample.tolist()))
                 if ema: ema.restore(mdl)
 
 class CodeDataset(Dataset):
     exts = {".py", ".js", ".ts", ".go", ".java", ".cs", ".cpp", ".c"}
-    def __init__(self, root: str, tokenizer: Tokenizer, seq_len: int):
-        self.tokenizer = tokenizer
+    def __init__(self, root: str, tokenizer: Tokenizer, seq_len: int, tokenizer_path: Optional[str] = None):
+        self._tokenizer = tokenizer
+        self.tokenizer_path = tokenizer_path
         self.seq_len = seq_len
         self.file_chunks = []
-        self._cache = {} 
+        self._cache = {}
         self._cache_size = 200
 
         print("Scanning dataset...")
+        tokenizer = self._ensure_tokenizer()
+        stride = max(1, self.seq_len // 2)
         for p in Path(root).rglob("*"):
             if p.suffix.lower() in self.exts:
                 try:
                     text = p.read_text(encoding="utf-8", errors="ignore")
-                    num_toks = len(self.tokenizer.encode(text).ids)
-                    for i in range(0, num_toks, seq_len):
-                        if i + seq_len <= num_toks or num_toks - i >= seq_len // 2:
-                            self.file_chunks.append((str(p), i, min(i + seq_len, num_toks)))
+                    num_toks = len(tokenizer.encode(text).ids)
+                    for i in range(0, num_toks, stride):
+                        end = min(i + self.seq_len, num_toks)
+                        if end - i >= self.seq_len // 2:
+                            self.file_chunks.append((str(p), i, end))
                 except Exception:
                     continue
         if not self.file_chunks:
             raise RuntimeError(f"No valid code files found in {root}")
         print(f"Found {len(self.file_chunks)} chunks across {len(set(fc[0] for fc in self.file_chunks))} files.")
 
-    def __len__(self): 
+    def _ensure_tokenizer(self) -> Tokenizer:
+        if self._tokenizer is None:
+            if not self.tokenizer_path:
+                raise RuntimeError("Tokenizer not initialized and tokenizer_path was not provided.")
+            self._tokenizer = Tokenizer.from_file(self.tokenizer_path)
+        return self._tokenizer
+
+    def __getstate__(self):
+        """
+        Make the dataset spawn-safe for multiprocessing DataLoader workers:
+        - Avoid pickling the Tokenizer object (not reliably picklable across platforms/Python versions).
+        - Drop the per-process cache so workers start clean.
+        """
+        state = self.__dict__.copy()
+        state["_tokenizer"] = None
+        state["_cache"] = {}
+        return state
+
+    def __len__(self):
         return len(self.file_chunks)
 
     def _get_chunk_from_file(self, file_path_str: str, start_idx: int, end_idx: int) -> List[int]:
@@ -404,7 +457,7 @@ class CodeDataset(Dataset):
         else:
             try:
                 text = Path(file_path_str).read_text(encoding="utf-8", errors="ignore")
-                all_ids = self.tokenizer.encode(text).ids
+                all_ids = self._ensure_tokenizer().encode(text).ids
                 if len(self._cache) >= self._cache_size:
                     del self._cache[next(iter(self._cache))]
                 self._cache[file_path_str] = all_ids
@@ -412,36 +465,41 @@ class CodeDataset(Dataset):
                 return []
         return all_ids[start_idx:end_idx]
 
-    def __getitem__(self, i): 
+    def __getitem__(self, i):
         target_path, target_start, target_end = self.file_chunks[i]
         target_chunk = self._get_chunk_from_file(target_path, target_start, target_end)
 
-        rand_idx = random.randint(0, len(self.file_chunks) - 1)
-        prompt_path, prompt_start, prompt_end = self.file_chunks[rand_idx]
-        prompt_chunk = self._get_chunk_from_file(prompt_path, prompt_start, prompt_end)
-        
+        # Prompt = previous context window from the same file (teaches meaningful conditioning).
+        if target_start <= 0:
+            prompt_start = 0
+            prompt_end = target_end
+        else:
+            prompt_end = target_start
+            prompt_start = max(0, prompt_end - self.seq_len)
+        prompt_chunk = self._get_chunk_from_file(target_path, prompt_start, prompt_end)
+
         if not target_chunk or not prompt_chunk:
             return self.__getitem__(random.randint(0, len(self) - 1))
 
         return target_chunk, prompt_chunk
 
-def make_loader(batch_size: int, seq_len: int, data_dir: str, tokenizer: Tokenizer, is_ddp: bool = False) -> Tuple[DataLoader, int]:
-    ds = CodeDataset(data_dir, tokenizer, seq_len)
+def make_loader(batch_size: int, seq_len: int, data_dir: str, tokenizer: Tokenizer, is_ddp: bool = False, tokenizer_path: Optional[str] = None, device: Optional[torch.device] = None) -> Tuple[DataLoader, int]:
+    ds = CodeDataset(data_dir, tokenizer, seq_len, tokenizer_path=tokenizer_path)
     pad_id = tokenizer.token_to_id("<pad>")
     if pad_id is None: raise ValueError("Tokenizer must have a <pad> token.")
-
-    def collate_fn(b: List[Tuple[List[int], List[int]]]):
-        targets, prompts = [], []
-        for target_ids, prompt_ids in b:
-            if not target_ids or not prompt_ids: continue
-            targets.append(torch.tensor((target_ids + [pad_id] * seq_len)[:seq_len], dtype=torch.long))
-            prompts.append(torch.tensor((prompt_ids + [pad_id] * seq_len)[:seq_len], dtype=torch.long))
-
-        if not targets: return torch.empty(0), torch.empty(0)
-        return torch.stack(targets), torch.stack(prompts)
+    pin_memory = bool(device is not None and device.type == "cuda")
 
     sampler = DistributedSampler(ds, shuffle=True) if is_ddp else None
-    loader = DataLoader(ds, batch_size=batch_size, shuffle=(sampler is None), sampler=sampler, collate_fn=collate_fn, drop_last=True, num_workers=4, pin_memory=True)
+    loader = DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=(sampler is None),
+        sampler=sampler,
+        collate_fn=TokenCollator(seq_len=seq_len, pad_id=pad_id),
+        drop_last=True,
+        num_workers=4,
+        pin_memory=pin_memory,
+    )
     return loader, pad_id
 
 def main():
@@ -456,7 +514,7 @@ def main():
     p.add_argument("--use-ema", action="store_true")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--use-lr-scheduler", action="store_true", help="Use CosineAnnealingLR scheduler.")
-    
+
     p.add_argument("--sequence_length", type=int, default=sequence_length)
     p.add_argument("--hidden-size", type=int, default=hidden_size)
     p.add_argument("--num-layers", type=int, default=num_layers)
@@ -473,7 +531,8 @@ def main():
     p.add_argument("--data-dir", type=str, default=None)
     p.add_argument("--ckpt-dir", type=str, default="checkpoints")
     p.add_argument("--tokenizer-file", type=str, default="checkpoints/bpe_tokenizer.json")
-    
+    p.add_argument("--tokenizer-vocab-size", type=int, default=50000, help="If tokenizer file is missing, train a new BPE tokenizer with this vocab size.")
+
     p.add_argument("--phase", choices=["train", "generate"], default="train")
     p.add_argument("--prompt", type=str, default=None)
     args = p.parse_args()
@@ -488,25 +547,39 @@ def main():
 
     if local_rank == 0: print(f"DDP: {is_ddp}, Rank: {local_rank}, Device: {device}")
 
+    data_dir = args.data_dir if args.data_dir else "."
+
     tokenizer_path = args.tokenizer_file
     if args.resume and args.phase == "train":
         latest_ckpt = find_latest_checkpoint(args.ckpt_dir)
         if latest_ckpt:
             ckpt = torch.load(latest_ckpt, map_location='cpu')
             if ckpt.get('tokenizer_path'): tokenizer_path = ckpt['tokenizer_path']
-    
+
     if not Path(tokenizer_path).exists():
-        raise FileNotFoundError(f"Tokenizer not found: {tokenizer_path}")
-    
+        if local_rank == 0:
+            print(f"Tokenizer not found: {tokenizer_path}")
+            print(f"Training a new BPE tokenizer on '{data_dir}' (vocab_size={args.tokenizer_vocab_size})...")
+            try:
+                from train_tokenizer import train_bpe_tokenizer
+            except Exception as e:
+                raise FileNotFoundError(
+                    f"Tokenizer not found: {tokenizer_path}. Also failed to import tokenizer trainer."
+                ) from e
+            train_bpe_tokenizer(data_dir, args.tokenizer_vocab_size, tokenizer_path)
+        if "WORLD_SIZE" in os.environ:
+            dist.barrier()
+        if not Path(tokenizer_path).exists():
+            raise FileNotFoundError(f"Tokenizer not found: {tokenizer_path}")
+
     tokenizer = Tokenizer.from_file(tokenizer_path)
     if local_rank == 0: print(f"Tokenizer loaded (vocab size: {tokenizer.get_vocab_size()})")
-    
-    data_dir = args.data_dir if args.data_dir else "."
+
     vsize, pad_id = tokenizer.get_vocab_size(), tokenizer.token_to_id("<pad>")
 
     model = DiffusionTransformer(vsize, args.hidden_size, args.num_layers, args.num_heads, args.dim_feedforward, args.sequence_length, pad_id).to(device)
     opt = optim.Adam(model.parameters(), lr=args.learning_rate)
-    
+
     scheduler = CosineAnnealingLR(opt, T_max=args.epochs * args.steps) if args.use_lr_scheduler else None
 
     if is_ddp: model = DDP(model, device_ids=[local_rank])
@@ -515,7 +588,7 @@ def main():
     sampler_cfg = {"kind": args.sampler, "every": 10, "extra": {"steps": args.ddim_steps, "eta": args.ddim_eta}}
 
     if args.phase == "train":
-        loader, pad_id = make_loader(args.batch_size, args.sequence_length, data_dir, tokenizer, is_ddp)
+        loader, pad_id = make_loader(args.batch_size, args.sequence_length, data_dir, tokenizer, is_ddp, tokenizer_path=tokenizer_path, device=device)
         train(model, opt, scheduler, args.epochs, args.steps, loader, acp, ema, device, args.amp, sampler_cfg, is_ddp, args.ckpt_dir, args, tokenizer, pad_id)
     elif args.phase == "generate":
         if local_rank == 0: print("To generate samples, please use generate.py")

@@ -1,0 +1,6 @@
+# Core dependencies
+#
+# Note: install the appropriate PyTorch build (CPU/CUDA/MPS) for your platform.
+torch>=2.0
+tokenizers>=0.15.0
+numpy>=1.26.0
